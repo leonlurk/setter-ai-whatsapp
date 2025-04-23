@@ -1,0 +1,15 @@
+[
+  {
+    "name": "Saludo Simple",
+    "steps": [
+      {
+        "content": "�Recibido!",
+        "type": "send_message"
+      }
+    ],
+    "trigger": "hola bot",
+    "id": "401f72f4-b711-4131-9cef-576a6fcd09b1",
+    "createdAt": "2025-04-22T19:15:06.266Z",
+    "updatedAt": "2025-04-22T19:15:06.266Z"
+  }
+]

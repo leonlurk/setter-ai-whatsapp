@@ -137,4 +137,14 @@ Thumbs.db
 *.ntvs*
 *.njsproj
 *.sln
-*.sw? 
+*.sw?
+
+# Firebase Service Account Key
+serviceAccountKey.json
+
+# whatsapp-web.js cache and session data
+.wwebjs_cache/
+data_v2/
+
+# SQLite database file (if not needed)
+whatsapp_manager_v2.db 
