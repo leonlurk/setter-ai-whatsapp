@@ -1,0 +1,1416 @@
+const path = require('path');
+const fs = require('fs');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js'); // Usar LocalAuth para sesiones persistentes
+const qrcode = require('qrcode-terminal');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+require('dotenv').config(); // Cargar variables de entorno (ej. GEMINI_API_KEY)
+const { loadData, saveData } = require('./utils'); // Importar desde utils.js
+const admin = require('firebase-admin'); 
+
+// --- Obtener User ID --- 
+const userId = process.argv[2]; 
+if (!userId) {
+    console.error('[Worker] ERROR: No se proporcionó userId al iniciar el worker.');
+    process.exit(1); // Salir si no hay ID de usuario
+}
+console.log(`[Worker ${userId}] Iniciando worker...`);
+
+// --- Obtener Active Agent ID (pasado como 3er argumento) ---
+let currentAgentId = process.argv[3] || null;
+console.log(`[Worker ${userId}] Active Agent ID inicial: ${currentAgentId || 'Ninguno (usará default)'}`);
+
+// --- Definición de Rutas y Archivos --- 
+const USER_DATA_PATH = path.join(__dirname, 'data_v2', userId);
+const SESSION_PATH = path.join(USER_DATA_PATH, '.wwebjs_auth'); // Directorio para la sesión de WhatsApp
+const AGENT_CONFIG_FILE = path.join(USER_DATA_PATH, 'agent_config.json');
+const RULES_FILE = path.join(USER_DATA_PATH, 'rules.json');
+const GEMINI_STARTERS_FILE = path.join(USER_DATA_PATH, 'gemini-starters.json');
+const UPLOADS_DIR = path.join(USER_DATA_PATH, 'uploads'); // Directorio de uploads por usuario
+const ACTION_FLOWS_FILE = path.join(__dirname, 'action_flows.json'); // Ruta al archivo global de flujos
+
+// Crear directorios específicos del usuario si no existen
+if (!fs.existsSync(USER_DATA_PATH)) fs.mkdirSync(USER_DATA_PATH, { recursive: true });
+if (!fs.existsSync(SESSION_PATH)) fs.mkdirSync(SESSION_PATH, { recursive: true });
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
+// --- Carga Inicial de Configuración --- 
+console.log(`[Worker ${userId}] Preparando configuración inicial (esperando datos via IPC)...`);
+
+// Configuración por defecto para el agente
+const DEFAULT_AGENT_CONFIG = {
+    persona: { name: "Agente IA (Default)", role: "Asistente", language: "es", tone: "Neutral", style: "Directo", guidelines: [] }, 
+    knowledge: { files: [], urls: [], qandas: [] } 
+};
+
+// Variable para almacenar la configuración del agente ACTIVO
+let agentConfig = { ...DEFAULT_AGENT_CONFIG }; // Iniciar con el default
+
+// Variables para almacenar reglas y flujos
+let autoReplyRules = []; // Reglas simples de respuesta automática
+let geminiConversationStarters = []; // Starters de conversación con Gemini
+let actionFlows = []; // Flujos de acción
+
+// <<< ADDED: Firestore Initialization for Worker >>>
+let firestoreDbWorker;
+try {
+    // Re-initialize using the same credentials as the master process expects
+    const serviceAccountPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    if (!serviceAccountPath || !fs.existsSync(serviceAccountPath)) {
+        throw new Error(`Service account key not found at: ${serviceAccountPath}`);
+    }
+    // Check if Firebase app is already initialized (less likely in separate process, but good practice)
+    if (admin.apps.length === 0) {
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccountPath)
+        });
+         console.log(`[Worker ${userId}] Firebase Admin SDK initialized in worker.`);
+    } else {
+         console.log(`[Worker ${userId}] Firebase Admin SDK already initialized.`);
+    }
+    firestoreDbWorker = admin.firestore();
+} catch (error) {
+    console.error(`[Worker ${userId}][ERROR CRÍTICO] Initializing Firebase Admin SDK in worker:`, error);
+    // Notify master?
+    sendErrorInfo(`Critical Firebase Init Error: ${error.message}`);
+    // Exit? If Firestore is essential for state, the worker might be useless without it.
+    process.exit(1);
+}
+// <<< END: Firestore Initialization for Worker >>>
+
+// <<< ADDED: Gemini Initialization with try...catch >>>
+try {
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    if (!geminiApiKey) {
+      throw new Error("GEMINI_API_KEY environment variable is not defined.");
+    }
+    const genAI = new GoogleGenerativeAI(geminiApiKey);
+    geminiModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash"});
+    console.log(`[Worker ${userId}] Gemini Model initialized successfully. Type: ${typeof geminiModel}`); // Log success and type
+} catch(geminiInitError) {
+    console.error(`[Worker ${userId}][ERROR CRÍTICO] Initializing GoogleGenerativeAI:`, geminiInitError);
+    sendErrorInfo(`Critical Gemini Init Error: ${geminiInitError.message}`);
+    // Exit? If Gemini is essential, the worker might be useless without it.
+    process.exit(1);
+}
+// <<< END: Gemini Initialization >>>
+
+// <<< ADDED: Sistema de rate limiting para Gemini >>>
+// Variables para el rate limiting
+let geminiRequestsInLastMinute = 0;
+let geminiRequestsTimestamps = [];
+const MAX_GEMINI_REQUESTS_PER_MINUTE = 30; // Ajustar según límites de tu API
+const REQUEST_TRACKING_WINDOW_MS = 60000; // 1 minuto en milisegundos
+
+// Función para verificar y gestionar rate limiting
+function checkGeminiRateLimit() {
+    const now = Date.now();
+    
+    // Eliminar timestamps antiguos (mayores a 1 minuto)
+    geminiRequestsTimestamps = geminiRequestsTimestamps.filter(timestamp => 
+        now - timestamp < REQUEST_TRACKING_WINDOW_MS
+    );
+    
+    // Verificar cuántas solicitudes hemos hecho en el último minuto
+    geminiRequestsInLastMinute = geminiRequestsTimestamps.length;
+    
+    // Si estamos cerca del límite, esperar
+    if (geminiRequestsInLastMinute >= MAX_GEMINI_REQUESTS_PER_MINUTE) {
+        const oldestRequest = geminiRequestsTimestamps[0];
+        const timeToWaitMs = REQUEST_TRACKING_WINDOW_MS - (now - oldestRequest) + 100; // +100ms de margen
+        
+        console.warn(`[Worker ${userId}][RATE LIMIT] Límite de solicitudes Gemini alcanzado (${geminiRequestsInLastMinute}/${MAX_GEMINI_REQUESTS_PER_MINUTE}). Esperando ${timeToWaitMs}ms...`);
+        return timeToWaitMs;
+    }
+    
+    // Si no hay problema, registrar la nueva solicitud
+    geminiRequestsTimestamps.push(now);
+    return 0; // No es necesario esperar
+}
+
+// <<< ADDED: Respuestas de fallback para cuando Gemini no está disponible >>>
+const FALLBACK_RESPONSES = [
+    "Lo siento, en este momento estoy experimentando una alta demanda. ¿Podrías intentar de nuevo en unos minutos?",
+    "Disculpa la interrupción. Estoy procesando muchas consultas en este momento. Por favor, inténtalo de nuevo más tarde.",
+    "Parece que hay mucho tráfico en el sistema. Intentaré responder tu mensaje más tarde cuando haya menos carga.",
+    "Estoy teniendo dificultades para procesar tu solicitud en este momento debido a limitaciones temporales de recursos. Te atenderé en cuanto pueda."
+];
+
+// Función para obtener una respuesta de fallback aleatoria
+function getFallbackResponse() {
+    const randomIndex = Math.floor(Math.random() * FALLBACK_RESPONSES.length);
+    return FALLBACK_RESPONSES[randomIndex];
+}
+
+// Actualizar callGeminiWithRetry para usar respuestas de fallback cuando sea necesario
+async function callGeminiWithRetry(prompt, maxRetries = 3, initialBackoffMs = 1000) {
+    let retryCount = 0;
+    let backoffMs = initialBackoffMs;
+
+    // Verificar rate limiting antes de hacer la solicitud
+    const waitTimeMs = checkGeminiRateLimit();
+    if (waitTimeMs > 0) {
+        console.log(`[Worker ${userId}][Gemini] Esperando ${waitTimeMs}ms por rate limiting...`);
+        await new Promise(resolve => setTimeout(resolve, waitTimeMs));
+    }
+
+    while (retryCount <= maxRetries) {
+        try {
+            console.log(`[Worker ${userId}][Gemini] Intento ${retryCount + 1}/${maxRetries + 1} para generar contenido`);
+            const result = await geminiModel.generateContent(prompt);
+            return await result.response.text();
+        } catch (error) {
+            console.error(`[Worker ${userId}][Gemini] Error en intento ${retryCount + 1}:`, error);
+            
+            // Verificar si es un error de cuota (429)
+            if (error.status === 429) {
+                const retryDelay = error.errorDetails?.find(detail => 
+                    detail['@type'] === 'type.googleapis.com/google.rpc.RetryInfo'
+                )?.retryDelay;
+                
+                // Extraer segundos del retryDelay si está presente ('24s' -> 24000)
+                let waitTime = backoffMs;
+                if (retryDelay) {
+                    const seconds = parseInt(retryDelay.replace('s', ''));
+                    if (!isNaN(seconds)) {
+                        waitTime = seconds * 1000;
+                        console.log(`[Worker ${userId}][Gemini] Google recomienda esperar ${seconds}s antes de reintentar`);
+                    }
+                }
+                
+                // Aumentar backoff para el próximo intento
+                backoffMs = backoffMs * 2;
+                
+                if (retryCount < maxRetries) {
+                    console.log(`[Worker ${userId}][Gemini] Error de cuota (429). Esperando ${waitTime/1000}s antes de reintentar...`);
+                    await new Promise(resolve => setTimeout(resolve, waitTime));
+                    retryCount++;
+                    continue;
+                }
+            }
+            
+            // Si no es un error de cuota o se acabaron los intentos, propagar el error
+            if (retryCount >= maxRetries) {
+                console.error(`[Worker ${userId}][Gemini] Se agotaron los reintentos (${maxRetries + 1}). Error: ${error.message}`);
+                // En lugar de propagar el error, devolver una respuesta de fallback
+                console.log(`[Worker ${userId}][Gemini] Utilizando respuesta de fallback`);
+                return getFallbackResponse();
+            }
+            
+            // Para otros errores, implementar backoff exponencial
+            if (retryCount < maxRetries) {
+                console.log(`[Worker ${userId}][Gemini] Reintentando en ${backoffMs/1000}s...`);
+                await new Promise(resolve => setTimeout(resolve, backoffMs));
+                backoffMs = backoffMs * 2; // Backoff exponencial
+                retryCount++;
+            } else {
+                // En lugar de propagar el error, devolver una respuesta de fallback
+                console.log(`[Worker ${userId}][Gemini] Utilizando respuesta de fallback por error general`);
+                return getFallbackResponse();
+            }
+        }
+    }
+}
+// <<< END: Sistema de rate limiting para Gemini >>>
+
+// Función para enviar estado/error al proceso Master
+function sendStatusUpdate(status, error = null) {
+    if (process.send) {
+        process.send({ type: 'STATUS_UPDATE', status, error });
+    } else {
+        console.warn(`[Worker ${userId}] Imposible enviar STATUS_UPDATE (process.send no disponible)`);
+    }
+}
+
+// Función para enviar QR al proceso Master
+function sendQrCode(qr) {
+    if (process.send) {
+        process.send({ type: 'QR_CODE', qr });
+    } else {
+         console.warn(`[Worker ${userId}] Imposible enviar QR_CODE (process.send no disponible)`);
+    }
+}
+
+// Función para enviar un error específico al Master
+function sendErrorInfo(errorMsg) {
+     if (process.send) {
+        process.send({ type: 'ERROR_INFO', error: errorMsg });
+    } else {
+        console.error(`[Worker ${userId}] ERROR: ${errorMsg} (process.send no disponible)`);
+    }
+}
+
+// --- Función auxiliar para resolver variables en strings ---
+function resolveVariables(templateString, context) {
+    if (!templateString || typeof templateString !== 'string') {
+        return templateString; // Devuelve el original si no es un string válido
+    }
+    // Regex para encontrar {{path.to.variable}}
+    return templateString.replace(/\{\{([^}]+)\}\}/g, (match, path) => {
+        try {
+            const keys = path.trim().split('.');
+            let value = context;
+            for (const key of keys) {
+                if (value === undefined || value === null) {
+                    // console.warn(`[resolveVariables] Path intermedio ${key} no encontrado en contexto para ${path}`);
+                    return match; // No reemplazar si el path es inválido
+                }
+                value = value[key];
+            }
+            return typeof value === 'object' ? JSON.stringify(value) : (value ?? match);
+        } catch (error) {
+            console.error(`[resolveVariables] Error resolviendo path "${path}":`, error);
+            return match;
+        }
+    });
+}
+
+// --- Función auxiliar para evaluar condiciones ---
+function evaluateCondition(conditionObj, context) {
+    if (!conditionObj || typeof conditionObj !== 'object' || !conditionObj.variable || !conditionObj.operator) {
+        console.warn('[evaluateCondition] Condición inválida: falta variable u operador.');
+        return false;
+    }
+
+    const { variable, operator, value: compareValue } = conditionObj;
+    let actualValue = null;
+
+    try {
+        const keys = variable.trim().split('.');
+        let current = context;
+        for (const key of keys) {
+            if (current === undefined || current === null) throw new Error(`Path intermedio ${key} no encontrado.`);
+            current = current[key];
+        }
+        actualValue = current;
+    } catch (error) {
+        // console.warn(`[evaluateCondition] No se pudo obtener valor para variable "${variable}": ${error.message}`);
+        actualValue = null;
+    }
+
+    const actualValueStr = actualValue === null || actualValue === undefined ? '' : String(actualValue);
+    const compareValueStr = compareValue === null || compareValue === undefined ? '' : String(compareValue);
+
+    // console.log(`[evaluateCondition] Evaluando: "${actualValueStr}" ${operator} "${compareValueStr}"`);
+
+    switch (operator.toLowerCase()) {
+        case 'equals':
+            return actualValueStr === compareValueStr;
+        case 'contains':
+            return actualValueStr.includes(compareValueStr);
+        case 'starts_with':
+            return actualValueStr.startsWith(compareValueStr);
+        case 'is_empty':
+            return actualValue === null || actualValue === undefined || actualValueStr === '';
+        default:
+            console.warn(`[evaluateCondition] Operador desconocido: ${operator}`);
+            return false;
+    }
+}
+
+// --- Función auxiliar para añadir un retraso aleatorio ---
+function randomDelay(minMs = 2500, maxMs = 3500) {
+  const delayTime = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+  console.log(`   -> [Delay] Esperando ${delayTime}ms antes de enviar...`);
+  return new Promise(resolve => setTimeout(resolve, delayTime));
+}
+
+// --- Función REFACTORIZADA para ejecutar una lista de pasos ---
+async function executeSteps(stepsToExecute, context) {
+    const userId = context.message.from; // Usar sender para logs
+
+    for (const step of stepsToExecute) {
+        // console.log(`[Worker ${userId}][Flow Engine] Procesando paso tipo: ${step.type}`); // Log detallado
+        switch (step.type) {
+            case 'send_message':
+                if (step.content) {
+                    const resolvedContent = resolveVariables(step.content, context);
+                    try {
+                         // <<< MODIFICADO: Usar nueva función de presencia >>>
+                         const originalSender = context.message?.from; 
+                         if (originalSender) { // Asegurarse de que tenemos un sender
+                            const userIsActiveFlow = await isUserActiveInChat(userId, originalSender);
+                            if (userIsActiveFlow) {
+                                console.log(`[Worker ${userId}][Presence DB][Flow] User is active in chat ${originalSender}. Skipping send_message step.`);
+                                break; // Sale del switch para este paso, continúa con el siguiente del flujo
+                            }
+                         } else {
+                             console.warn(`[Worker ${userId}][Flow Engine] No se pudo determinar el remitente original en el contexto para el chequeo de presencia.`);
+                             // ¿Continuar o detener? Por ahora continuamos.
+                         }
+                         // <<< FIN MODIFICACIÓN >>>
+
+                         console.log(`   -> INTENTANDO enviar mensaje: "${resolvedContent}"`); 
+                         await randomDelay(); // <<< AÑADIDO DELAY
+                         await client.sendMessage(context.message.from, resolvedContent);
+                         
+                         // Guardar el mensaje automático en Firestore con isAutoReply=true
+                         try {
+                             const chatDocRef = firestoreDbWorker.collection('users').doc(userId)
+                                 .collection('chats').doc(context.message.from);
+                             const messagesColRef = chatDocRef.collection('messages');
+                             
+                             await messagesColRef.add({
+                                 from: `me (Flow - ${userId})`,
+                                 to: context.message.from,
+                                 body: resolvedContent,
+                                 timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                                 isFromMe: true,
+                                 isAutoReply: true
+                             });
+                             
+                             console.log(`[Worker ${userId}][Flow Engine] Mensaje automático guardado en Firestore con isAutoReply=true`);
+                         } catch (dbError) {
+                             console.error(`[Worker ${userId}][Flow Engine] Error guardando mensaje automático en Firestore:`, dbError);
+                         }
+                         // Log original (después) lo dejamos comentado o lo quitamos si preferimos
+                         // console.log(`   -> Mensaje enviado: "${resolvedContent}"`);
+                    } catch (sendError) {
+                         console.error(`[Worker ${userId}][Flow Engine] Error enviando mensaje en paso:`, sendError);
+                         sendErrorInfo(`Error enviando mensaje de flujo: ${sendError.message}`);
+                    }
+                } else {
+                    console.warn(`   -> Paso send_message sin 'content'. Saltando.`);
+                }
+                break;
+            
+            case 'run_gemini':
+                if (step.prompt && typeof step.prompt === 'string') {
+                    const resolvedPrompt = resolveVariables(step.prompt, context);
+                    // console.log(`   -> Ejecutando Gemini con prompt resuelto: "${resolvedPrompt.substring(0, 50)}..."`);
+                    try {
+                        const result = await callGeminiWithRetry(resolvedPrompt);
+                        const geminiResponseText = await result;
+                        
+                        if (geminiResponseText) {
+                            // console.log(`   -> Respuesta Gemini generada.`);
+                            if (step.outputVariable && typeof step.outputVariable === 'string' && step.outputVariable.trim()) {
+                                const varName = step.outputVariable.trim();
+                                context.variables[varName] = geminiResponseText;
+                                // console.log(`      -> Respuesta guardada en context.variables.${varName}`);
+                            } else {
+                                // console.log(`      -> No se especificó outputVariable. Enviando respuesta directamente.`);
+                                try {
+                                    await randomDelay(); // <<< AÑADIDO DELAY
+                                    await client.sendMessage(context.message.from, geminiResponseText);
+                                    // console.log(`         -> Respuesta Gemini enviada a ${context.message.from}.`);
+                                } catch (sendError) {
+                                      console.error(`[Worker ${userId}][Flow Engine] Error enviando respuesta Gemini:`, sendError);
+                                      sendErrorInfo(`Error enviando resp Gemini: ${sendError.message}`);
+                                }
+                            }
+                            // await new Promise(resolve => setTimeout(resolve, 300)); // Delay menor eliminado
+                        } else {
+                            console.warn(`   -> Gemini no generó respuesta para el prompt.`);
+                            if (step.outputVariable && typeof step.outputVariable === 'string' && step.outputVariable.trim()) {
+                                context.variables[step.outputVariable.trim()] = null;
+                            }
+                        }
+                    } catch (geminiError) {
+                       console.error(`   -> [Error Gemini] Error ejecutando el paso run_gemini:`, geminiError);
+                       sendErrorInfo(`Error en paso run_gemini: ${geminiError.message}`);
+                       if (step.outputVariable && typeof step.outputVariable === 'string' && step.outputVariable.trim()) {
+                            context.variables[step.outputVariable.trim()] = null;
+                       }
+                    }
+                } else {
+                    console.warn(`   -> Paso run_gemini sin 'prompt' válido. Saltando.`);
+                }
+                break;
+            
+            case 'condition':
+                if (step.if && step.then && Array.isArray(step.then)) {
+                    // console.log(`   -> Evaluando condición...`);
+                    const conditionResult = evaluateCondition(step.if, context);
+                    // console.log(`      -> Resultado de la condición: ${conditionResult}`);
+
+                    if (conditionResult) {
+                        // console.log(`   -> Ejecutando bloque 'then'...`);
+                        await executeSteps(step.then, context); // Llamada recursiva
+                    } else if (step.else && Array.isArray(step.else)) {
+                        // console.log(`   -> Ejecutando bloque 'else'...`);
+                        await executeSteps(step.else, context); // Llamada recursiva
+                    } // else: no hacer nada si es falso y no hay bloque else
+                } else {
+                    console.warn(`   -> Paso condition mal formado (falta 'if' o 'then'). Saltando.`);
+                }
+                break;
+
+            default:
+                console.warn(`   -> Tipo de paso desconocido: ${step.type}. Saltando.`);
+                break;
+        }
+    }
+}
+
+// --- Función PRINCIPAL para ejecutar flujos de acción (refactorizada) ---
+async function executeActionFlow(message, flow) {
+    const sender = message.from;
+    const userId = sender; // Identificador para logs
+    console.log(`[Worker ${userId}][Flow Engine] Iniciando flujo: ${flow.name} (ID: ${flow.id})`);
+
+    if (!flow.steps || !Array.isArray(flow.steps) || flow.steps.length === 0) {
+        console.error(`[Worker ${userId}][Flow Engine] Error: Flujo ${flow.id} sin pasos válidos.`);
+        return;
+    }
+
+    const flowContext = {
+        message: { from: sender, body: message.body, id: message.id.id },
+        variables: {}
+    };
+
+    try {
+        await executeSteps(flow.steps, flowContext);
+        console.log(`[Worker ${userId}][Flow Engine] Flujo ${flow.name} completado.`);
+
+    } catch (error) {
+        console.error(`[Worker ${userId}][Flow Engine] Error GRAL ejecutando flujo ${flow.name}:`, error);
+        sendErrorInfo(`Error ejecutando flujo ${flow.id}: ${error.message}`);
+    }
+}
+
+// --- Listeners de Eventos del Cliente WhatsApp ---
+const client = new Client({
+    authStrategy: new LocalAuth({ clientId: userId, dataPath: SESSION_PATH }), // Usa LocalAuth con ruta específica
+    puppeteer: {
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'], // Añadir disable-gpu
+        headless: true
+    }
+});
+
+// AÑADIR FUNCIÓN DE DIAGNÓSTICO DE PUPPETEER
+async function diagnosePuppeteerEnvironment() {
+    console.log(`[Worker ${userId}][DIAGNÓSTICO] Verificando entorno para Puppeteer...`);
+    try {
+        // Verificar requisitos del sistema
+        const chromiumPath = require('puppeteer').executablePath();
+        console.log(`[Worker ${userId}][DIAGNÓSTICO] Ruta ejecutable Chromium: ${chromiumPath}`);
+        
+        // Verificar si la ruta existe
+        if (fs.existsSync(chromiumPath)) {
+            console.log(`[Worker ${userId}][DIAGNÓSTICO] ✅ Ejecutable Chromium encontrado`);
+        } else {
+            console.error(`[Worker ${userId}][DIAGNÓSTICO] ❌ Ejecutable Chromium NO ENCONTRADO en la ruta`);
+        }
+        
+        // Verificar permisos y espacio en disco
+        try {
+            const stats = fs.statSync(chromiumPath);
+            console.log(`[Worker ${userId}][DIAGNÓSTICO] Permisos Chromium: ${stats.mode}, Tamaño: ${stats.size} bytes`);
+        } catch (statErr) {
+            console.error(`[Worker ${userId}][DIAGNÓSTICO] ❌ Error verificando permisos: ${statErr.message}`);
+        }
+        
+        // Verificar dependencias
+        try {
+            const { execSync } = require('child_process');
+            const libsCheck = execSync('ldd $(which chromium-browser) | grep "not found" || echo "All dependencies OK"').toString();
+            console.log(`[Worker ${userId}][DIAGNÓSTICO] Verificación dependencias:\n${libsCheck}`);
+        } catch (libErr) {
+            console.error(`[Worker ${userId}][DIAGNÓSTICO] ❌ Error verificando dependencias: ${libErr.message}`);
+        }
+        
+        // Verificar memoria disponible
+        try {
+            const { execSync } = require('child_process');
+            const memInfo = execSync('free -m').toString();
+            console.log(`[Worker ${userId}][DIAGNÓSTICO] Información de memoria:\n${memInfo}`);
+        } catch (memErr) {
+            console.error(`[Worker ${userId}][DIAGNÓSTICO] ❌ Error verificando memoria: ${memErr.message}`);
+        }
+        
+        console.log(`[Worker ${userId}][DIAGNÓSTICO] Verificación de entorno completada`);
+    } catch (error) {
+        console.error(`[Worker ${userId}][DIAGNÓSTICO] ❌ Error general: ${error.message}`);
+    }
+}
+
+// Ejecutar diagnóstico antes de inicializar
+diagnosePuppeteerEnvironment()
+    .then(() => {
+        console.log(`[Worker ${userId}][CRITICAL] ANTES de client.initialize(). Client tipo: ${typeof client}, isValid: ${!!client}`);
+        try {
+            client.initialize()
+                .then(() => {
+                    console.log(`[Worker ${userId}][CRITICAL] client.initialize() completado con éxito en el .then()`);
+                })
+                .catch(initError => {
+                    console.error(`[Worker ${userId}][CRITICAL] ERROR en client.initialize().catch():`, initError);
+                    sendErrorInfo(`Error en initialize(): ${initError.message}`);
+                    // Notificar al servidor sobre el error crítico
+                    sendStatusUpdate('error', `Error de inicialización: ${initError.message}`);
+                });
+            console.log(`[Worker ${userId}][CRITICAL] Llamada a client.initialize() realizada. Esperando eventos...`);
+        } catch (outerError) {
+            console.error(`[Worker ${userId}][CRITICAL] ERROR EXTERNO al llamar client.initialize():`, outerError);
+            sendErrorInfo(`Error externo initialize(): ${outerError.message}`);
+            sendStatusUpdate('error', `Error crítico: ${outerError.message}`);
+        }
+    })
+    .catch(diagErr => {
+        console.error(`[Worker ${userId}][CRITICAL] Error en diagnóstico previo: ${diagErr.message}`);
+        sendErrorInfo(`Error en diagnóstico previo: ${diagErr.message}`);
+        sendStatusUpdate('error', `Error en diagnóstico previo: ${diagErr.message}`);
+});
+
+client.on('qr', async (qr) => {
+    console.log(`[Worker ${userId}] QR Recibido. Generando Data URL...`);
+    sendStatusUpdate('generating_qr'); // Informar al master
+    try {
+        const qrCodeUrl = await qrcode.generate(qr, { small: true });
+        console.log(`[Worker ${userId}] QR Data URL generado.`);
+        sendQrCode(qrCodeUrl); // Enviar QR al master
+    } catch (err) {
+        console.error(`[Worker ${userId}] ERROR generando QR Data URL:`, err);
+        sendStatusUpdate('error', 'Error generando QR');
+    }
+});
+
+// Eventos de depuración adicionales de Puppeteer para WhatsApp Web
+client.pupBrowser?.on('disconnected', () => {
+    console.error(`[Worker ${userId}][CRITICAL] Navegador Puppeteer desconectado inesperadamente`);
+    sendStatusUpdate('error', 'Navegador Puppeteer desconectado');
+});
+
+client.on('ready', () => {
+    console.log(`[Worker ${userId}] Cliente WhatsApp LISTO!`);
+    sendStatusUpdate('connected'); // Informar al master
+});
+
+client.on('authenticated', () => {
+    console.log(`[Worker ${userId}] Cliente AUTENTICADO`);
+    // Podríamos enviar un estado intermedio si quisiéramos
+    // sendStatusUpdate('authenticated'); 
+});
+
+client.on('auth_failure', (msg) => {
+    console.error(`[Worker ${userId}] FALLO DE AUTENTICACIÓN: ${msg}`);
+    sendStatusUpdate('error', `Fallo de autenticación: ${msg}`);
+    // Production Consideration: Decide if auth failure is fatal. Often it is.
+    // Consider exiting: process.exit(1);
+});
+
+client.on('disconnected', (reason) => {
+  console.log(`[Worker ${userId}] Cliente DESCONECTADO:`, reason);
+  // No in-memory state to clear anymore.
+  sendStatusUpdate('disconnected', `Desconectado: ${reason}`);
+  // ¿Intentar reiniciar automáticamente? Por ahora no.
+});
+
+client.on('loading_screen', (percent, message) => {
+    console.log(`[Worker ${userId}] Cargando: ${percent}% - ${message}`);
+    // Podríamos enviar este progreso al Master si quisiéramos
+});
+
+// Eventos adicionales para diagnosticar problemas de conectividad
+client.on('change_state', state => {
+    console.log(`[Worker ${userId}][STATE] Estado del cliente cambiado a: ${state}`);
+});
+
+client.on('change_battery', batteryInfo => {
+    console.log(`[Worker ${userId}][BATTERY] Info batería actualizada:`, batteryInfo);
+});
+
+// Monitorear TODOS los tipos de mensajes
+client.on('message_create', async (message) => {
+    console.log(`[Worker ${userId}][MESSAGE_CREATE] Mensaje creado. FromMe: ${message.fromMe}, From: ${message.from}, Body: "${message.body?.substring(0, 30)}..."`);
+    
+    // Solo procesar mensajes salientes (fromMe = true)
+    // Los entrantes ya son procesados por el evento 'message'
+    if (message.fromMe && !message.id.remote.endsWith('@g.us')) {
+        console.log(`[Worker ${userId}][MESSAGE_CREATE] Procesando mensaje SALIENTE para guardar en Firestore`);
+        
+        // Determinar el ID del destinatario (chatPartnerId) para Firestore
+        const chatPartnerId = message.to;
+        
+        // Referencias de Firestore
+        const chatDocRef = firestoreDbWorker.collection('users').doc(userId).collection('chats').doc(chatPartnerId);
+        const messagesColRef = chatDocRef.collection('messages');
+        
+        try {
+            console.log(`[Worker ${userId}][FIRESTORE] Guardando mensaje SALIENTE en: users/${userId}/chats/${chatPartnerId}/messages`);
+            const messageData = {
+                body: message.body,
+                timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                isFromMe: true,
+                isAutoReply: null, // Explícitamente null para diferenciar de los mensajes automáticos
+                IS_GENUINE_USER: true, // NUEVO: flag muy explícito para mensajes reales del usuario
+                messageId: message.id.id,
+                from: `me (User REAL - ${userId})`, // Modificado para ser muy explícito
+                to: chatPartnerId
+            };
+            console.log(`[Worker ${userId}][FIRESTORE] Datos a guardar (mensaje saliente):`, JSON.stringify(messageData));
+            
+            // Guardar el mensaje y obtener referencia
+            const messageRef = await messagesColRef.add(messageData);
+            console.log(`[Worker ${userId}][FIRESTORE] Mensaje SALIENTE guardado con ID: ${messageRef.id}`);
+            
+            // Verificar que se guardó correctamente
+            const savedMessage = await messageRef.get();
+            if (savedMessage.exists) {
+                console.log(`[Worker ${userId}][FIRESTORE] ✅ Verificación: Mensaje SALIENTE guardado correctamente`);
+            } else {
+                console.error(`[Worker ${userId}][FIRESTORE] ❌ ERROR DE VERIFICACIÓN: El mensaje SALIENTE no se guardó correctamente`);
+            }
+            
+            // IMPORTANTE: Actualizar lastUserMessageTimestamp para mensajes salientes del usuario real
+            let chatUpdateData = { 
+                lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+                lastUserMessageTimestamp: admin.firestore.FieldValue.serverTimestamp() // Esto es clave para el cálculo de presencia
+            };
+            
+            await chatDocRef.set(chatUpdateData, { merge: true });
+            console.log(`[Worker ${userId}][FIRESTORE] ✅ Documento chat actualizado con lastUserMessageTimestamp`);
+            
+            // Verificar actualización del documento chat
+            const updatedChatDoc = await chatDocRef.get();
+            if (updatedChatDoc.exists) {
+                console.log(`[Worker ${userId}][FIRESTORE] ✅ Verificación: Documento chat actualizado:`, JSON.stringify(updatedChatDoc.data()));
+            }
+        } catch (dbError) {
+            console.error(`[Worker ${userId}][FIRESTORE] 🔴 ERROR guardando mensaje SALIENTE:`, dbError);
+            sendErrorInfo(`Error guardando mensaje saliente: ${dbError.message}`);
+        }
+    }
+});
+
+client.on('message_revoke_everyone', async (after, before) => {
+    console.log(`[Worker ${userId}][MESSAGE_REVOKE] Mensaje eliminado. FromMe: ${after.fromMe}, From: ${after.from}`);
+});
+
+client.on('message_ack', async (message, ack) => {
+    // ACK: 1 = enviado, 2 = recibido, 3 = leído, 4 = reproducido
+    console.log(`[Worker ${userId}][MESSAGE_ACK] Confirmación para mensaje. ACK: ${ack}, ID: ${message.id?.id}`);
+});
+
+// --- Procesamiento de Mensajes (adaptado del server.js original) ---
+client.on('message', async (message) => {
+  // <<< AÑADIR ESTOS LOGS EXTENSIVOS AL INICIO DEL EVENTO >>>
+  console.log(`\n[Worker ${userId}][MESSAGE EVENT] ====== NUEVO MENSAJE DETECTADO ======`);
+  console.log(`[Worker ${userId}][MESSAGE EVENT] Timestamp: ${new Date().toISOString()}`);
+  console.log(`[Worker ${userId}][MESSAGE EVENT] Message ID: ${message.id?.id || 'unknown'}`);
+  console.log(`[Worker ${userId}][MESSAGE EVENT] From: ${message.from || 'unknown'}`);
+  console.log(`[Worker ${userId}][MESSAGE EVENT] To: ${message.to || 'unknown'}`);
+  console.log(`[Worker ${userId}][MESSAGE EVENT] FromMe: ${message.fromMe}`);
+  console.log(`[Worker ${userId}][MESSAGE EVENT] Body: "${message.body?.substring(0, 100)}..."`);
+  console.log(`[Worker ${userId}][MESSAGE EVENT] HasMedia: ${!!message.hasMedia}`);
+  console.log(`[Worker ${userId}][MESSAGE EVENT] IsGroup: ${message.id?.remote?.endsWith('@g.us') || false}`);
+  console.log(`[Worker ${userId}][MESSAGE EVENT] Raw Object: ${JSON.stringify(message, (key, value) => {
+    // Eliminar propiedades circulares o muy grandes
+    if (key === 'client' || key === '_data' || key === 'mediaData') return '[Object]';
+    return value;
+  }, 2).substring(0, 500)}...`);
+  
+  // <<< VERIFICAR SI PUPPETEER SIGUE FUNCIONANDO >>>
+  try {
+    if (!client.pupBrowser || !client.pupPage) {
+      console.error(`[Worker ${userId}][ERROR CRÍTICO] Puppeteer browser/page no disponible en evento message. Browser: ${!!client.pupBrowser}, Page: ${!!client.pupPage}`);
+      sendErrorInfo(`Puppeteer no disponible al procesar mensaje. Es posible que se haya desconectado.`);
+    } else {
+      console.log(`[Worker ${userId}][PUPPETEER STATUS] Browser: OK, Page: OK`);
+    }
+  } catch (puppeteerCheckError) {
+    console.error(`[Worker ${userId}][ERROR CRÍTICO] Error verificando estado Puppeteer:`, puppeteerCheckError);
+  }
+
+  // <<< AÑADIR LOGS TEMPRANO >>>
+  console.log(`[Worker ${userId}][DEBUG] Message event fired. isFromMe: ${message.fromMe}, From: ${message.from}, To: ${message.to}, Body: "${message.body?.substring(0, 30)}..."`); 
+  // <<< FIN DEL LOG TEMPRANO >>>
+
+  // <<< INICIO: Lógica Modificada para Guardar TODOS los mensajes >>>
+  const sender = message.from; 
+  const recipient = message.to; 
+  const isFromMe = message.fromMe;
+  const isGroup = message.id.remote.endsWith('@g.us');
+
+  // Ignorar grupos por ahora
+  if (isGroup) return;
+
+  // Determinar el ID del interlocutor para Firestore
+  const chatPartnerId = isFromMe ? recipient : sender;
+  
+  console.log(`[Worker ${userId}][MSG ${isFromMe ? 'OUT' : 'IN'}] ${isFromMe ? 'To' : 'From'}: ${chatPartnerId}, Body: "${message.body?.substring(0, 50)}..."`);
+
+  // Referencias de Firestore
+  const chatDocRef = firestoreDbWorker.collection('users').doc(userId).collection('chats').doc(chatPartnerId);
+  const messagesColRef = chatDocRef.collection('messages');
+
+  // Guardar SIEMPRE el mensaje en Firestore
+  try {
+    console.log(`[Worker ${userId}][FIRESTORE] Guardando mensaje en: users/${userId}/chats/${chatPartnerId}/messages`);
+    const messageData = {
+        body: message.body,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        isFromMe: isFromMe, 
+        messageId: message.id.id,
+        // Asegurar que se guarda la fuente del mensaje correctamente
+        from: isFromMe ? `me (User REAL - ${userId})` : chatPartnerId,
+        to: isFromMe ? chatPartnerId : `me (User REAL - ${userId})`,
+        isAutoReply: isFromMe ? null : false,  // Explícitamente null para mensajes del usuario real
+        IS_GENUINE_USER: isFromMe ? true : false // NUEVO: Mensajes del usuario real son genuinos
+    };
+    
+    console.log(`[Worker ${userId}][FIRESTORE] Datos a guardar:`, JSON.stringify(messageData));
+    
+    // Guardar el mensaje y obtener referencia
+    const messageRef = await messagesColRef.add(messageData);
+    console.log(`[Worker ${userId}][FIRESTORE] Mensaje guardado con ID: ${messageRef.id}`);
+    
+    // Verificar que se guardó correctamente
+    const savedMessage = await messageRef.get();
+    if (savedMessage.exists) {
+        console.log(`[Worker ${userId}][FIRESTORE] ✅ Verificación: Mensaje guardado correctamente`);
+        console.log(`[Worker ${userId}][FIRESTORE] Datos guardados:`, JSON.stringify(savedMessage.data()));
+    } else {
+        console.error(`[Worker ${userId}][FIRESTORE] ❌ ERROR DE VERIFICACIÓN: El mensaje no se guardó correctamente`);
+    }
+
+    let chatUpdateData = { 
+        lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp()
+    }; 
+    if (isFromMe) {
+        chatUpdateData.lastUserMessageTimestamp = admin.firestore.FieldValue.serverTimestamp();
+    }
+    await chatDocRef.set(chatUpdateData, { merge: true });
+    
+    // Verificar actualización del documento chat
+    const updatedChatDoc = await chatDocRef.get();
+    console.log(`[Worker ${userId}][FIRESTORE] ✅ Documento chat actualizado:`, JSON.stringify(updatedChatDoc.data()));
+
+  } catch (dbError) {
+      console.error(`[Worker ${userId}][FIRESTORE] 🔴 ERROR guardando mensaje para ${chatPartnerId}:`, dbError);
+      sendErrorInfo(`Error guardando mensaje: ${dbError.message}`);
+  }
+
+  if (isFromMe) {
+      console.log(`[Worker ${userId}] Mensaje es propio (fromMe=true). Terminando procesamiento.`);
+      return; 
+  }
+  console.log(`[Worker ${userId}] Mensaje es de otro usuario. Continuando procesamiento...`);
+  // <<< FIN: Lógica Modificada para Guardar TODOS los mensajes >>>
+
+  // --- Añadir log de isUserActiveInChat ---
+  console.log(`[Worker ${userId}][PRESENCE CHECK] Verificando actividad para usuario ${userId} en chat ${sender}...`);
+  const userIsActive = await isUserActiveInChat(userId, sender);
+  console.log(`[Worker ${userId}][PRESENCE CHECK] Resultado: ${userIsActive ? 'ACTIVO' : 'INACTIVO'} (${userIsActive ? 'no responder automáticamente' : 'responder automáticamente'})`);
+
+  try {
+    // Si el usuario está inactivo, procesar respuestas automáticas
+    if (!userIsActive) {
+      console.log(`[Worker ${userId}][AUTO-REPLY] Usuario INACTIVO. Procesando posibles respuestas automáticas para: ${sender}`);
+
+      // 1. Verificar si hay un flujo activado por el mensaje
+      const matchedFlow = actionFlows.find(flow => {
+        const messageTextLower = message.body.trim().toLowerCase();
+        const triggerTextLower = flow.trigger?.trim().toLowerCase();
+        return messageTextLower === triggerTextLower;
+      });
+
+      if (matchedFlow) {
+        console.log(`[Worker ${userId}][AUTO-REPLY] Encontrado flujo coincidente: ${matchedFlow.name} (ID: ${matchedFlow.id}). Ejecutando...`);
+        await executeActionFlow(message, matchedFlow);
+        return; // Terminar aquí si se ejecutó un flujo
+      }
+
+      // 2. Verificar si hay una regla simple que coincida
+      const matchingSimpleRule = autoReplyRules.find(rule => {
+        const messageTextInternal = message.body.trim().toLowerCase();
+        const triggerText = rule.trigger.trim().toLowerCase();
+        return messageTextInternal.includes(triggerText) || messageTextInternal === triggerText;
+      });
+
+      if (matchingSimpleRule) {
+        console.log(`[Worker ${userId}][AUTO-REPLY] Encontrada regla simple coincidente. Respondiendo: "${matchingSimpleRule.response}"`);
+            await randomDelay(); 
+        await client.sendMessage(sender, matchingSimpleRule.response);
+        
+        // Guardar la respuesta automática en Firestore
+            try {
+                await messagesColRef.add({
+            from: `me (Auto - ${userId})`,
+                    to: sender,
+            body: matchingSimpleRule.response,
+                    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+            isFromMe: true,
+            isAutoReply: true,
+            IS_GENUINE_USER: false // NUEVO: Flag explícito para mensajes automáticos
+                });
+                await chatDocRef.set({ lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+          console.log(`[Worker ${userId}][AUTO-REPLY] Respuesta de regla simple guardada en Firestore.`);
+            } catch (dbError) {
+          console.error(`[Worker ${userId}][Firestore Error] Error guardando respuesta de regla simple:`, dbError);
+        }
+        return; // Terminar aquí si se ejecutó una regla simple
+      }
+
+      // 3. Verificar si hay un starter de conversación Gemini
+        const matchedStarter = geminiConversationStarters.find(starter => {
+            const messageTextInternal = message.body.trim().toLowerCase();
+            const triggerText = starter.trigger.trim().toLowerCase();
+            return messageTextInternal.includes(triggerText) || messageTextInternal === triggerText;
+        });
+
+        if (matchedStarter) {
+        console.log(`[Worker ${userId}][AUTO-REPLY] Encontrado starter Gemini: "${matchedStarter.trigger}". Iniciando conversación...`);
+            const newActivePrompt = matchedStarter.prompt;
+        
+        // Guardar el prompt activo en Firestore
+            try {
+                await chatDocRef.set({ activeGeminiPrompt: newActivePrompt }, { merge: true });
+          console.log(`[Worker ${userId}][AUTO-REPLY] Prompt Gemini activo guardado en Firestore: "${newActivePrompt}"`);
+            } catch (dbError) {
+          console.error(`[Worker ${userId}][Firestore Error] Error guardando prompt activo:`, dbError);
+            }
+            
+        // Obtener contexto de mensajes recientes
+            let starterContext = '';
+            try {
+                const recentMessagesSnap = await messagesColRef.orderBy('timestamp', 'desc').limit(10).get();
+                const recentMessages = recentMessagesSnap.docs.reverse().map(doc => {
+                    const msgData = doc.data();
+                    return msgData.isFromMe ? `IA: ${msgData.body}` : `Usuario: ${msgData.body}`;
+                });
+                starterContext = recentMessages.join('\n');
+            } catch (dbError) {
+          console.error(`[Worker ${userId}][Firestore Error] Error obteniendo contexto para starter:`, dbError);
+                starterContext = ' (Error cargando historial) ';
+            }
+        
+        // Generar primera respuesta de Gemini
+        const basePrompt = `Eres ${agentConfig.persona?.name || 'un asistente virtual'}. \nRol: ${agentConfig.persona?.role || 'Ayudar a los usuarios.'}\nTono: ${agentConfig.persona?.tone || 'amable'}. \nEstilo: ${agentConfig.persona?.style || 'claro'}. \nIdioma: ${agentConfig.persona?.language || 'es'}.\nDirectrices importantes:\n${(agentConfig.persona?.guidelines || []).map(g => `- ${g}`).join('\n') || '- Responde de forma concisa.'}\n---\n`;
+            
+            const firstResponsePrompt = `${basePrompt}${newActivePrompt}\n\n---\nHistorial Reciente:\n${starterContext}\n\n---\nPrimer Mensaje Recibido (que activó esto):\nUsuario: ${message.body}\n\n---\nTu Primera Respuesta (inicia la conversación según rol y directrices):`;
+            
+        console.log(`[Worker ${userId}][AUTO-REPLY] Enviando prompt inicial a Gemini...`);
+        try {
+            const result = await callGeminiWithRetry(firstResponsePrompt);
+            const geminiResponse = await result;
+            
+            if (geminiResponse) {
+            console.log(`[Worker ${userId}][AUTO-REPLY] Respuesta Gemini generada: "${geminiResponse.substring(0, 50)}..."`);
+                 await randomDelay(); 
+                 await client.sendMessage(sender, geminiResponse);
+            
+            // Guardar respuesta en Firestore
+                 try {
+                     await messagesColRef.add({
+                         from: `me (IA - ${userId})`,
+                         to: sender,
+                         body: geminiResponse,
+                         timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                         isFromMe: true,
+                         isAutoReply: true,
+                         IS_GENUINE_USER: false // NUEVO: Flag explícito para mensajes automáticos
+                     });
+                     await chatDocRef.set({ lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+              console.log(`[Worker ${userId}][AUTO-REPLY] Respuesta Gemini guardada en Firestore.`);
+                 } catch (dbError) {
+              console.error(`[Worker ${userId}][Firestore Error] Error guardando respuesta Gemini:`, dbError);
+            }
+          } else {
+            console.warn(`[Worker ${userId}][AUTO-REPLY] Gemini no generó respuesta para el prompt inicial.`);
+                         await chatDocRef.update({ activeGeminiPrompt: null });
+          }
+        } catch (geminiError) {
+          console.error(`[Worker ${userId}][AUTO-REPLY] Error generando respuesta Gemini:`, geminiError);
+          await chatDocRef.update({ activeGeminiPrompt: null });
+        }
+        return; // Terminar aquí si se procesó un starter
+      }
+
+      // 4. Verificar si hay una conversación activa con Gemini
+      try {
+        const chatDataActive = await chatDocRef.get();
+        const activeGeminiPrompt = chatDataActive.exists ? chatDataActive.data()?.activeGeminiPrompt : null;
+        
+        if (activeGeminiPrompt) {
+          console.log(`[Worker ${userId}][AUTO-REPLY] Conversación Gemini activa encontrada. Prompt: "${activeGeminiPrompt.substring(0, 50)}..."`);
+          
+          // Obtener contexto de mensajes recientes
+          let conversationContext = '';
+          try {
+            const recentMessagesSnap = await messagesColRef.orderBy('timestamp', 'desc').limit(10).get();
+            const recentMessages = recentMessagesSnap.docs.reverse().map(doc => {
+              const msgData = doc.data();
+              return msgData.isFromMe ? `IA: ${msgData.body}` : `Usuario: ${msgData.body}`;
+            });
+            conversationContext = recentMessages.join('\n');
+          } catch (dbError) {
+            console.error(`[Worker ${userId}][Firestore Error] Error obteniendo contexto de conversación:`, dbError);
+            conversationContext = ' (Error cargando historial) ';
+          }
+          
+          // Generar respuesta de continuación
+          const basePrompt = `Eres ${agentConfig.persona?.name || 'un asistente virtual'}. \nRol: ${agentConfig.persona?.role || 'Ayudar a los usuarios.'}\nTono: ${agentConfig.persona?.tone || 'amable'}. \nEstilo: ${agentConfig.persona?.style || 'claro'}. \nIdioma: ${agentConfig.persona?.language || 'es'}.\nDirectrices importantes:\n${(agentConfig.persona?.guidelines || []).map(g => `- ${g}`).join('\n') || '- Responde de forma concisa.'}\n---\n`;
+          
+          const conversationPrompt = `${basePrompt}${activeGeminiPrompt}\n\n---\nHistorial Reciente:\n${conversationContext}\n\n---\nMensaje Actual:\nUsuario: ${message.body}\n\n---\nTu Respuesta (sigue la conversación y directrices):`;
+          
+          console.log(`[Worker ${userId}][AUTO-REPLY] Enviando prompt de continuación a Gemini...`);
+          try {
+            const result = await callGeminiWithRetry(conversationPrompt);
+            const geminiResponse = await result;
+            
+            if (geminiResponse) {
+              console.log(`[Worker ${userId}][AUTO-REPLY] Respuesta Gemini generada: "${geminiResponse.substring(0, 50)}..."`);
+        await randomDelay(); 
+              await client.sendMessage(sender, geminiResponse);
+              
+              // Guardar respuesta en Firestore
+        try {
+            await messagesColRef.add({
+                  from: `me (IA - ${userId})`,
+                to: sender,
+                  body: geminiResponse,
+                timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                  isFromMe: true,
+                  isAutoReply: true,
+                  IS_GENUINE_USER: false // NUEVO: Flag explícito para mensajes automáticos
+            });
+            await chatDocRef.set({ lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+                console.log(`[Worker ${userId}][AUTO-REPLY] Respuesta Gemini guardada en Firestore.`);
+        } catch (dbError) {
+                console.error(`[Worker ${userId}][Firestore Error] Error guardando respuesta Gemini:`, dbError);
+              }
+              
+              // Verificar si hay keyword de finalización
+              const lowerBody = message.body.toLowerCase().trim();
+              const endKeywords = ['gracias', 'chau', 'nos vemos', 'adios', 'hasta luego'];
+              if (endKeywords.some(keyword => lowerBody.includes(keyword))) {
+                console.log(`[Worker ${userId}][AUTO-REPLY] Detectada palabra clave de finalización. Cerrando conversación.`);
+                await chatDocRef.update({ activeGeminiPrompt: null });
+              }
+    } else {
+              console.warn(`[Worker ${userId}][AUTO-REPLY] Gemini no generó respuesta para la conversación.`);
+            }
+          } catch (geminiError) {
+            console.error(`[Worker ${userId}][AUTO-REPLY] Error generando respuesta Gemini:`, geminiError);
+          }
+          return; // Terminar aquí si se continuó una conversación
+        }
+      } catch (chatError) {
+        console.error(`[Worker ${userId}][AUTO-REPLY] Error verificando conversación activa:`, chatError);
+      }
+
+      // 5. Si no hay reglas, starters ni conversación activa, generar respuesta por defecto
+      console.log(`[Worker ${userId}][AUTO-REPLY] No se encontraron reglas ni conversaciones activas. Generando respuesta por defecto...`);
+      
+      // Obtener contexto de mensajes recientes
+            let defaultContext = '';
+            try {
+                const recentMessagesSnap = await messagesColRef.orderBy('timestamp', 'desc').limit(10).get();
+                const recentMessages = recentMessagesSnap.docs.reverse().map(doc => {
+                    const msgData = doc.data();
+                    return msgData.isFromMe ? `IA: ${msgData.body}` : `Usuario: ${msgData.body}`;
+                });
+                defaultContext = recentMessages.join('\n');
+            } catch (dbError) {
+        console.error(`[Worker ${userId}][Firestore Error] Error obteniendo contexto para respuesta default:`, dbError);
+                defaultContext = ' (Error cargando historial) ';
+            }
+      
+      // Generar respuesta por defecto
+      const basePrompt = `Eres ${agentConfig.persona?.name || 'un asistente virtual'}. \nRol: ${agentConfig.persona?.role || 'Ayudar a los usuarios.'}\nTono: ${agentConfig.persona?.tone || 'amable'}. \nEstilo: ${agentConfig.persona?.style || 'claro'}. \nIdioma: ${agentConfig.persona?.language || 'es'}.\nDirectrices importantes:\n${(agentConfig.persona?.guidelines || []).map(g => `- ${g}`).join('\n') || '- Responde de forma concisa.'}\n---\n`;
+            
+            const defaultAiPrompt = `${basePrompt}
+---
+Historial Reciente:
+${defaultContext}
+
+---
+Mensaje Actual del Usuario:
+Usuario: ${message.body}
+
+---
+Tu Respuesta (siguiendo rol, tono, directrices y contexto):`;
+
+      console.log(`[Worker ${userId}][AUTO-REPLY] Enviando prompt default a Gemini...`);
+            try {
+                const result = await callGeminiWithRetry(defaultAiPrompt);
+                const geminiResponse = await result;
+
+                if (geminiResponse) {
+          console.log(`[Worker ${userId}][AUTO-REPLY] Respuesta Gemini default generada: "${geminiResponse.substring(0, 50)}..."`);
+                    await randomDelay(); 
+                    await client.sendMessage(sender, geminiResponse);
+          
+          // Guardar respuesta en Firestore
+                    try {
+                        await messagesColRef.add({
+                            from: `me (IA - ${userId})`,
+                            to: sender,
+                            body: geminiResponse,
+                            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                            isFromMe: true,
+                            isAutoReply: true,
+                            IS_GENUINE_USER: false // NUEVO: Flag explícito para mensajes automáticos
+                        });
+                        await chatDocRef.set({ lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+            console.log(`[Worker ${userId}][AUTO-REPLY] Respuesta Gemini default guardada en Firestore.`);
+                    } catch (dbError) {
+            console.error(`[Worker ${userId}][Firestore Error] Error guardando respuesta Gemini default:`, dbError);
+                    }
+                } else {
+          console.warn(`[Worker ${userId}][AUTO-REPLY] Gemini no generó respuesta default.`);
+                }
+            } catch (geminiError) {
+        console.error(`[Worker ${userId}][AUTO-REPLY] Error generando respuesta Gemini default:`, geminiError);
+      }
+    } else {
+      console.log(`[Worker ${userId}][AUTO-REPLY] Usuario ACTIVO. No se enviarán respuestas automáticas.`);
+    }
+  } catch (presenceError) {
+    console.error(`[Worker ${userId}][AUTO-REPLY] Error en flujo de respuesta automática:`, presenceError);
+    sendErrorInfo(`Error en flujo de respuesta automática: ${presenceError.message}`);
+  }
+
+  // Resto del código del manejador...
+  // ... existing code ...
+});
+
+// === MANEJO DE COMANDOS IPC DEL MASTER ===
+let isShuttingDown = false;
+
+process.on('message', (message) => {
+    // --- Log AÑADIDO para depurar recepción --- 
+    console.log(`[Worker ${userId}] ===> process.on('message') RECIBIDO:`, JSON.stringify(message)); 
+
+    if (!message || !message.type) {
+        console.warn(`[Worker ${userId}] Mensaje IPC inválido recibido o sin tipo.`);
+        return;
+    }
+
+    console.log(`[IPC Worker ${userId}] Comando recibido del Master (Tipo: ${message.type}):`, message);
+
+    switch (message.type) {
+        case 'COMMAND':
+            handleCommand(message.command, message.payload);
+            break;
+            case 'SWITCH_AGENT':
+                console.log(`[Worker ${userId}] Recibido comando para cambiar agente activo...`, message.payload);
+                const switchPayload = message.payload;
+                currentAgentId = switchPayload?.agentId || null;
+                console.log(`[Worker ${userId}] ID de agente activo establecido a: ${currentAgentId || 'Ninguno (default)'}.`);
+            
+                if (switchPayload?.agentConfig) {
+                    agentConfig = switchPayload.agentConfig;
+                    console.log(`   -> Configuración de agente actualizada desde payload SWITCH_AGENT para: ${agentConfig.persona?.name || currentAgentId}`);
+                } else if (!currentAgentId) {
+                    agentConfig = { ...DEFAULT_AGENT_CONFIG }; // Volver a default si ID es null y no vino config
+                    console.log(`   -> Usando configuración de agente por defecto (ID es null).`);
+                } else {
+                    // No vino config en el payload, pero hay un agentId. Se usará la config que ya tenga cargada 
+                    // (posiblemente de INITIAL_CONFIG o un RELOAD anterior). Loguear advertencia.
+                    console.warn(`   -> SWITCH_AGENT recibido para ${currentAgentId} SIN payload de config. Se usará la config en memoria si existe.`);
+                    // En este punto, agentConfig NO se modifica.
+                }
+                break;
+        case 'INITIAL_CONFIG': // <<< ADDED: Manejar configuración inicial >>>
+            console.log(`[Worker ${userId}] Recibida configuración inicial del Master.`);
+            const configPayload = message.payload;
+            if (configPayload) {
+                agentConfig = configPayload.agentConfig || { ...DEFAULT_AGENT_CONFIG };
+                currentAgentId = agentConfig.id || null;
+                
+                autoReplyRules = Array.isArray(configPayload.rules) ? configPayload.rules : [];
+                geminiConversationStarters = Array.isArray(configPayload.starters) ? configPayload.starters : [];
+                actionFlows = Array.isArray(configPayload.flows) ? configPayload.flows : [];
+                
+                console.log(`   -> Agent Config Loaded: ${agentConfig.persona?.name || (currentAgentId ? `ID ${currentAgentId}` : 'Default')}`);
+                console.log(`   -> Rules Loaded: ${autoReplyRules.length}`);
+                console.log(`   -> Starters Loaded: ${geminiConversationStarters.length}`);
+                console.log(`   -> Flows Loaded: ${actionFlows.length}`);
+            } else {
+                console.warn(`[Worker ${userId}] Mensaje INITIAL_CONFIG recibido SIN payload. Usando defaults.`);
+                agentConfig = { ...DEFAULT_AGENT_CONFIG };
+                autoReplyRules = [];
+                geminiConversationStarters = [];
+                actionFlows = [];
+                currentAgentId = null;
+            }
+            break;
+        case 'RELOAD_FLOWS':
+            console.log(`[Worker ${userId}] Recibido comando para recargar flujos de acción...`);
+            if (payload && Array.isArray(payload.flows)) { 
+                actionFlows = payload.flows;
+                console.log(`   -> Flujos de acción actualizados desde payload. Total: ${actionFlows.length}`);
+            } else {
+                console.warn(`   -> Comando RELOAD_FLOWS recibido sin payload de flujos válido. No se puede actualizar.`);
+            }
+            break;
+        case 'RELOAD_RULES': // <<< ADDED
+            console.log(`[Worker ${userId}] Recibido comando RELOAD_RULES.`);
+            if (payload && Array.isArray(payload.rules)) {
+                autoReplyRules = payload.rules;
+                console.log(`   -> Reglas actualizadas desde payload. Total: ${autoReplyRules.length}`);
+            } else {
+                console.warn(`   -> Comando RELOAD_RULES recibido sin payload de reglas válido. No se puede actualizar.`);
+            }
+            break;
+        case 'RELOAD_STARTERS': // <<< ADDED
+            console.log(`[Worker ${userId}] Recibido comando RELOAD_STARTERS.`);
+            if (payload && Array.isArray(payload.starters)) {
+                geminiConversationStarters = payload.starters;
+                console.log(`   -> Starters actualizados desde payload. Total: ${geminiConversationStarters.length}`);
+            } else {
+                console.warn(`   -> Comando RELOAD_STARTERS recibido sin payload de starters válido. No se puede actualizar.`);
+            }
+            break;
+        case 'RELOAD_AGENT_CONFIG': // <<< ADDED
+             console.log(`[Worker ${userId}] Recibido comando RELOAD_AGENT_CONFIG.`);
+            if (payload && payload.agentConfig && payload.agentConfig.id === currentAgentId) {
+                agentConfig = payload.agentConfig;
+                console.log(`   -> Configuración para agente activo (${currentAgentId}) actualizada desde payload.`);
+            } else if (payload && payload.agentConfig && payload.agentConfig.id !== currentAgentId){
+                 console.warn(`   -> Recibido RELOAD_AGENT_CONFIG para agente ${payload.agentConfig.id}, pero el agente activo es ${currentAgentId}. Configuración no aplicada.`);
+             } else if (!payload || !payload.agentConfig) {
+                console.warn(`   -> Comando RELOAD_AGENT_CONFIG recibido sin payload de config válido. No se puede actualizar.`);
+            }
+            break;
+         // TODO: Añadir case para 'RELOAD_CONFIG' (para otras configs)
+         // ...
+        default:
+            console.warn(`[IPC Worker ${userId}] Tipo de mensaje no reconocido: ${message.type}`);
+    }
+});
+
+function handleCommand(command, payload) {
+    console.log(`[Worker ${userId}] Procesando comando: ${command}`);
+    switch (command) {
+        case 'SHUTDOWN':
+            console.log(`[Worker ${userId}] ===> ENTRANDO al case SHUTDOWN`); // Log inicio case
+            if (!isShuttingDown) {
+                isShuttingDown = true;
+                console.log(`[Worker ${userId}] Iniciando cierre ordenado... (isShuttingDown = true)`);
+                if (client) {
+                     console.log(`[Worker ${userId}] ===> INTENTANDO llamar a client.destroy()...`); // Log antes destroy
+                     client.destroy() // Intenta cerrar la sesión de WhatsApp limpiamente
+                        .then(() => {
+                            console.log(`[Worker ${userId}] ===> client.destroy() COMPLETADO (then).`); // Log en then
+                            console.log(`[Worker ${userId}] Cliente WhatsApp destruido. Saliendo con process.exit(0)...`);
+                            process.exit(0); // Salir después de destruir
+                        })
+                        .catch(err => {
+                            console.error(`[Worker ${userId}] ===> ERROR CAPTURADO en .catch() de client.destroy():`, err); // Log en catch
+                            console.error(`[Worker ${userId}] Saliendo con process.exit(1) debido a error en destroy...`);
+                            process.exit(1); // Salir con error si falla
+                        });
+                     console.log(`[Worker ${userId}] ===> Código DESPUÉS de la llamada a client.destroy() alcanzado.`); // Log después de llamada (no espera)
+                } else {
+                    console.log(`[Worker ${userId}] Cliente no inicializado, saliendo directamente con process.exit(0).`);
+                    process.exit(0);
+                }
+                 // Poner un temporizador por si destroy() se cuelga
+                 console.log(`[Worker ${userId}] ===> Estableciendo setTimeout de 10 segundos para forzar salida.`);
+                 setTimeout(() => {
+                    console.warn(`[Worker ${userId}] ===> TIMEOUT de cierre alcanzado! Forzando salida con process.exit(1).`); // Log en timeout
+                    process.exit(1);
+                 }, 10000); // 10 segundos de gracia
+            } else {
+                console.log(`[Worker ${userId}] ===> Comando SHUTDOWN recibido pero ya estaba en proceso de cierre (isShuttingDown=true).`);
+            }
+            break;
+        case 'RELOAD_FLOWS':
+            console.log(`[Worker ${userId}] Recibido comando para recargar flujos de acción...`);
+            if (payload && Array.isArray(payload.flows)) { 
+                actionFlows = payload.flows;
+                console.log(`   -> Flujos de acción actualizados desde payload. Total: ${actionFlows.length}`);
+            } else {
+                console.warn(`   -> Comando RELOAD_FLOWS recibido sin payload de flujos válido. No se puede actualizar.`);
+            }
+            break;
+        case 'SWITCH_AGENT':
+            console.log(`[Worker ${userId}] Procesando comando SWITCH_AGENT...`, payload);
+            const newAgentId = payload?.agentId || null;
+            currentAgentId = newAgentId;
+            console.log(`[Worker ${userId}] ID de agente activo establecido a: ${currentAgentId || 'Ninguno (default)'}.`);
+            if (!currentAgentId) {
+                console.log(`   -> Usando configuración de agente por defecto (ID es null).`);
+                agentConfig = { ...DEFAULT_AGENT_CONFIG };
+            } else {
+                 console.log(`   -> Se espera que la configuración para el agente ${currentAgentId} se reciba por separado si es necesario.`);
+            }
+            break;
+        case 'RELOAD_RULES': // <<< ADDED
+            console.log(`[Worker ${userId}] Recibido comando RELOAD_RULES.`);
+            if (payload && Array.isArray(payload.rules)) {
+                autoReplyRules = payload.rules;
+                console.log(`   -> Reglas actualizadas desde payload. Total: ${autoReplyRules.length}`);
+            } else {
+                console.warn(`   -> Comando RELOAD_RULES recibido sin payload de reglas válido. No se puede actualizar.`);
+            }
+            break;
+        case 'RELOAD_STARTERS': // <<< ADDED
+            console.log(`[Worker ${userId}] Recibido comando RELOAD_STARTERS.`);
+            if (payload && Array.isArray(payload.starters)) {
+                geminiConversationStarters = payload.starters;
+                console.log(`   -> Starters actualizados desde payload. Total: ${geminiConversationStarters.length}`);
+            } else {
+                console.warn(`   -> Comando RELOAD_STARTERS recibido sin payload de starters válido. No se puede actualizar.`);
+            }
+            break;
+        case 'RELOAD_AGENT_CONFIG': // <<< ADDED
+             console.log(`[Worker ${userId}] Recibido comando RELOAD_AGENT_CONFIG.`);
+            if (payload && payload.agentConfig && payload.agentConfig.id === currentAgentId) {
+                agentConfig = payload.agentConfig;
+                console.log(`   -> Configuración para agente activo (${currentAgentId}) actualizada desde payload.`);
+            } else if (payload && payload.agentConfig && payload.agentConfig.id !== currentAgentId){
+                 console.warn(`   -> Recibido RELOAD_AGENT_CONFIG para agente ${payload.agentConfig.id}, pero el agente activo es ${currentAgentId}. Configuración no aplicada.`);
+             } else if (!payload || !payload.agentConfig) {
+                console.warn(`   -> Comando RELOAD_AGENT_CONFIG recibido sin payload de config válido. No se puede actualizar.`);
+            }
+            break;
+         // TODO: Añadir case para 'RELOAD_CONFIG' (para otras configs)
+         // ...
+        default:
+            console.warn(`[IPC Worker ${userId}] Tipo de mensaje no reconocido: ${command}`);
+    }
+}
+
+// Añadir manejadores de excepciones no capturadas al final del archivo
+process.on('uncaughtException', (error) => {
+    console.error(`[Worker ${userId}][CRITICAL] UNCAUGHT EXCEPTION:`, error);
+    sendErrorInfo(`Excepción no capturada: ${error.message}\n${error.stack}`);
+    sendStatusUpdate('error', `Error crítico no capturado: ${error.message}`);
+    // No cerramos el proceso aquí para permitir debugging
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error(`[Worker ${userId}][CRITICAL] UNHANDLED REJECTION:`, reason);
+    sendErrorInfo(`Promesa rechazada no manejada: ${reason}`);
+    sendStatusUpdate('error', `Promesa rechazada no manejada: ${reason}`);
+    // No cerramos el proceso aquí para permitir debugging
+});
+
+// <<< REEMPLAZADO: Lógica de Presencia Basada en Firestore >>>
+async function isUserActiveInChat(userId, senderId) {
+    console.log(`\n[Worker ${userId}][PRESENCE] ====== VERIFICANDO PRESENCIA - NUEVA LÓGICA ESTRICTA ======`);
+    console.log(`[Worker ${userId}][PRESENCE] Parámetros: userId=${userId}, senderId=${senderId}`);
+    
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+    console.log(`[Worker ${userId}][PRESENCE] Timestamp límite: ${fiveMinutesAgo.toISOString()} (hace 5 minutos)`);
+    
+    const chatDocRef = firestoreDbWorker.collection('users').doc(userId).collection('chats').doc(senderId);
+    const messagesRef = chatDocRef.collection('messages');
+    
+    try {
+        // 1. Verificar si hay lastUserMessageTimestamp en el chat (método rápido)
+        const chatDoc = await chatDocRef.get();
+        if (!chatDoc.exists) {
+            console.log(`[Worker ${userId}][PRESENCE] ❌ El documento de chat no existe. Usuario considerado INACTIVO.`);
+            return false;
+        }
+        
+        if (chatDoc.data().lastUserMessageTimestamp) {
+            const lastTimestamp = chatDoc.data().lastUserMessageTimestamp.toDate();
+            const isActive = lastTimestamp > fiveMinutesAgo;
+            console.log(`[Worker ${userId}][PRESENCE] Usando lastUserMessageTimestamp del chat: ${lastTimestamp.toISOString()}`);
+            console.log(`[Worker ${userId}][PRESENCE] Resultado: Usuario ${isActive ? 'ACTIVO' : 'INACTIVO'}`);
+            return isActive;
+        }
+        
+        // 2. Buscar mensajes con el nuevo flag explícito IS_GENUINE_USER
+        console.log(`[Worker ${userId}][PRESENCE] Buscando mensajes con IS_GENUINE_USER=true`);
+        let genuineMessages;
+        try {
+            genuineMessages = await messagesRef
+                .where('IS_GENUINE_USER', '==', true)
+                .orderBy('timestamp', 'desc')
+                .limit(1)
+                .get();
+                
+            console.log(`[Worker ${userId}][PRESENCE] Encontrados ${genuineMessages.size} mensajes genuinos del usuario`);
+            
+            if (!genuineMessages.empty) {
+                const lastGenuineMsg = genuineMessages.docs[0].data();
+                const timestamp = lastGenuineMsg.timestamp?.toDate();
+                
+                if (timestamp) {
+                    const isActive = timestamp > fiveMinutesAgo;
+                    console.log(`[Worker ${userId}][PRESENCE] Último mensaje genuino: ${timestamp.toISOString()}`);
+                    console.log(`[Worker ${userId}][PRESENCE] Resultado: Usuario ${isActive ? 'ACTIVO' : 'INACTIVO'}`);
+                    
+                    // Actualizar lastUserMessageTimestamp para referencia futura
+                    await chatDocRef.set({
+                        lastUserMessageTimestamp: lastGenuineMsg.timestamp
+                    }, { merge: true });
+                    
+                    return isActive;
+                }
+            }
+            
+            // 3. Si no hay mensajes con IS_GENUINE_USER, buscar la manera antigua
+            console.log(`[Worker ${userId}][PRESENCE] No se encontraron mensajes con IS_GENUINE_USER, buscando con método alternativo`);
+            const oldMethodQuery = await messagesRef
+                .where('isFromMe', '==', true)
+                .where('isAutoReply', '==', null)
+                .orderBy('timestamp', 'desc')
+                .limit(5)
+                .get();
+                
+            if (!oldMethodQuery.empty) {
+                // Filtrar manualmente para mayor seguridad
+                const filteredDocs = oldMethodQuery.docs.filter(doc => {
+                    const data = doc.data();
+                    return data.isFromMe === true && 
+                           data.isAutoReply === null &&
+                           !data.from?.includes('Auto') && 
+                           !data.from?.includes('IA') && 
+                           !data.from?.includes('Flow');
+                });
+                
+                if (filteredDocs.length > 0) {
+                    const lastMessage = filteredDocs[0].data();
+                    const timestamp = lastMessage.timestamp?.toDate();
+                    
+                    if (timestamp) {
+                        const isActive = timestamp > fiveMinutesAgo;
+                        console.log(`[Worker ${userId}][PRESENCE] Último mensaje (método antiguo): ${timestamp.toISOString()}`);
+                        console.log(`[Worker ${userId}][PRESENCE] Resultado: Usuario ${isActive ? 'ACTIVO' : 'INACTIVO'}`);
+                        return isActive;
+                    }
+                }
+            }
+            
+            // Si llegamos aquí, no hemos encontrado mensajes genuinos del usuario
+            console.log(`[Worker ${userId}][PRESENCE] No se encontraron mensajes genuinos del usuario. INACTIVO.`);
+            return false;
+            
+        } catch (queryError) {
+            console.error(`[Worker ${userId}][PRESENCE] Error en consulta: ${queryError.message}`);
+            
+            // Método de último recurso: buscar por texto en los campos 'from'
+            const lastResortQuery = await messagesRef
+                .orderBy('timestamp', 'desc')
+                .limit(20)
+                .get();
+                
+            if (!lastResortQuery.empty) {
+                const realUserMsgs = lastResortQuery.docs.filter(doc => {
+                    const data = doc.data();
+                    return data.from?.includes('User REAL');
+                });
+                
+                if (realUserMsgs.length > 0) {
+                    const lastMessage = realUserMsgs[0].data();
+                    const timestamp = lastMessage.timestamp?.toDate();
+                    
+                    if (timestamp) {
+                        const isActive = timestamp > fiveMinutesAgo;
+                        console.log(`[Worker ${userId}][PRESENCE] Último mensaje (último recurso): ${timestamp.toISOString()}`);
+                        console.log(`[Worker ${userId}][PRESENCE] Resultado: Usuario ${isActive ? 'ACTIVO' : 'INACTIVO'}`);
+                        return isActive;
+                    }
+                }
+            }
+            
+            console.log(`[Worker ${userId}][PRESENCE] No se pudo determinar actividad. INACTIVO.`);
+            return false;
+        }
+        
+    } catch (error) {
+        console.error(`[Worker ${userId}][PRESENCE] Error crítico: ${error.message}`);
+        console.log(`[Worker ${userId}][PRESENCE] Por precaución, considerando al usuario ACTIVO.`);
+        return true; // Por seguridad, si hay error consideramos que está activo
+    }
+}
+// <<< FIN: Lógica de Presencia Basada en Firestore >>>
+

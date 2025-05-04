@@ -6,6 +6,8 @@ yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
 .pnpm-debug.log*
+firebase-debug.log*
+firebase-debug.*.log*
 
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
@@ -147,4 +149,20 @@ serviceAccountKey.json
 data_v2/
 
 # SQLite database file (if not needed)
-whatsapp_manager_v2.db 
+whatsapp_manager_v2.db
+
+# Firebase cache
+.firebase/
+
+# Firebase config (excepto plantillas)
+.firebaserc
+
+# Service account keys
+*-service-account-key.json
+
+# Functions
+functions/node_modules/
+functions/.env
+
+# Local emulator data
+*-export.json 

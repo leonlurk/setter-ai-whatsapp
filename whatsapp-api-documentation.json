@@ -1,0 +1,1307 @@
+{
+  "apiVersion": "1.0",
+  "apiName": "WhatsApp Integration API",
+  "basePath": "/",
+  "authentication": {
+    "type": "Bearer",
+    "headerName": "Authorization",
+    "description": "API requires Bearer token authentication using the API_SECRET_KEY environment variable"
+  },
+  "generalDescription": "This API enables integration with WhatsApp through a server and worker architecture. It supports managing WhatsApp connections, sending messages, creating conversational agents, setting up auto-reply rules, and automated action flows.",
+  "mainComponents": {
+    "server": "Main API server handling HTTP requests and WebSocket connections",
+    "worker": "Handles WhatsApp client connection and message processing for each user"
+  },
+  "dataStore": "Firebase Firestore for storing configuration, messages, and state",
+  "endpoints": [
+    {
+      "path": "/users",
+      "method": "GET",
+      "description": "Get a list of all registered users and their connection status",
+      "authentication": "Required",
+      "parameters": [],
+      "responses": {
+        "200": {
+          "description": "List of users retrieved successfully",
+          "schema": {
+            "success": "boolean",
+            "users": [
+              {
+                "user_id": "string",
+                "status": "string (disconnected|connected|connecting|generating_qr|error)",
+                "active_agent_id": "string|null",
+                "created_at": "ISO string timestamp",
+                "updated_at": "ISO string timestamp"
+              }
+            ]
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/connect",
+      "method": "POST",
+      "description": "Initiates the WhatsApp connection process for a specific user. If successful, the worker will start generating a QR code for the user to scan.",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "202": {
+          "description": "Connection request initiated successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "message": "string"
+          }
+        },
+        "404": {
+          "description": "User not found",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/disconnect",
+      "method": "POST",
+      "description": "Terminates the WhatsApp connection for a user",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Disconnect request successful",
+          "schema": {
+            "success": "boolean (true)",
+            "message": "string"
+          }
+        },
+        "404": {
+          "description": "User not found",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/status",
+      "method": "GET",
+      "description": "Get the current connection status and QR code (if in connecting state) for a user",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "User status retrieved successfully",
+          "schema": {
+            "success": "boolean",
+            "clientReady": "boolean",
+            "qrCodeUrl": "string|null (data URL of QR code if connecting)",
+            "status": "string (disconnected|connected|connecting|generating_qr|error)",
+            "errorMessage": "string|null"
+          }
+        },
+        "404": {
+          "description": "User not found",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/active-agent",
+      "method": "GET",
+      "description": "Get the currently active conversational agent for a user",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Active agent ID retrieved successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "activeAgentId": "string|null"
+          }
+        },
+        "404": {
+          "description": "User not found",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/send-message",
+      "method": "POST",
+      "description": "Send a message to a WhatsApp number from the user's connected account",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "number",
+          "in": "body",
+          "description": "WhatsApp number to send message to (international format without +)",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "message",
+          "in": "body",
+          "description": "Text message content to send",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "202": {
+          "description": "Message send command accepted",
+          "schema": {
+            "success": "boolean (true)",
+            "message": "string"
+          }
+        },
+        "400": {
+          "description": "Invalid request or worker not connected",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/rules",
+      "method": "GET",
+      "description": "Get all auto-reply rules for a user",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Rules retrieved successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "data": [
+              {
+                "id": "string (UUID)",
+                "trigger": "string (lowercase)",
+                "response": "string"
+              }
+            ]
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/add-rule",
+      "method": "POST",
+      "description": "Add a new auto-reply rule for a user",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "trigger",
+          "in": "body",
+          "description": "Text trigger that activates the rule (converted to lowercase)",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "response",
+          "in": "body",
+          "description": "Text response to send when trigger is detected",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "201": {
+          "description": "Rule created successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "message": "string",
+            "data": {
+              "id": "string (UUID)",
+              "trigger": "string (lowercase)",
+              "response": "string"
+            }
+          }
+        },
+        "400": {
+          "description": "Invalid request",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "409": {
+          "description": "Rule with this trigger already exists",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/rules/:ruleId",
+      "method": "DELETE",
+      "description": "Delete an auto-reply rule",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "ruleId",
+          "in": "path",
+          "description": "UUID of the rule to delete",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Rule deleted successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "message": "string"
+          }
+        },
+        "404": {
+          "description": "Rule not found",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/gemini-starters",
+      "method": "GET",
+      "description": "Get all Gemini conversation starters for a user",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Starters retrieved successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "data": [
+              {
+                "id": "string (UUID)",
+                "trigger": "string (lowercase)",
+                "prompt": "string"
+              }
+            ]
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/add-gemini-starter",
+      "method": "POST",
+      "description": "Add a new Gemini conversation starter for a user",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "trigger",
+          "in": "body",
+          "description": "Text trigger that activates the starter (converted to lowercase)",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "prompt",
+          "in": "body",
+          "description": "Prompt template to send to Gemini when trigger is detected",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "201": {
+          "description": "Starter created successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "message": "string",
+            "data": {
+              "id": "string (UUID)",
+              "trigger": "string (lowercase)",
+              "prompt": "string"
+            }
+          }
+        },
+        "400": {
+          "description": "Invalid request",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "409": {
+          "description": "Starter with this trigger already exists",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/gemini-starters/:starterId",
+      "method": "DELETE",
+      "description": "Delete a Gemini conversation starter",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "starterId",
+          "in": "path",
+          "description": "UUID of the starter to delete",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Starter deleted successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "message": "string"
+          }
+        },
+        "404": {
+          "description": "Starter not found",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/action-flows",
+      "method": "GET",
+      "description": "Get all action flows (automated sequential actions)",
+      "authentication": "Required",
+      "parameters": [],
+      "responses": {
+        "200": {
+          "description": "Flows retrieved successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "data": [
+              {
+                "id": "string (UUID)",
+                "name": "string",
+                "trigger": "string",
+                "steps": [
+                  {
+                    "type": "string (message|delay|condition|branch)",
+                    "content": "object (depends on step type)"
+                  }
+                ],
+                "createdAt": "ISO string timestamp",
+                "updatedAt": "ISO string timestamp"
+              }
+            ]
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/action-flows",
+      "method": "POST",
+      "description": "Create a new action flow",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "name",
+          "in": "body",
+          "description": "Name of the flow",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "trigger",
+          "in": "body",
+          "description": "Message trigger that activates the flow",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "steps",
+          "in": "body",
+          "description": "Array of step objects defining the flow actions",
+          "required": true,
+          "type": "array"
+        }
+      ],
+      "responses": {
+        "201": {
+          "description": "Flow created successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "message": "string",
+            "data": {
+              "id": "string (UUID)",
+              "name": "string",
+              "trigger": "string",
+              "steps": "array",
+              "createdAt": "ISO string timestamp",
+              "updatedAt": "ISO string timestamp"
+            }
+          }
+        },
+        "400": {
+          "description": "Invalid flow data",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/action-flows/:flowId",
+      "method": "GET",
+      "description": "Get a specific action flow by ID",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "flowId",
+          "in": "path",
+          "description": "UUID of the flow to retrieve",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Flow retrieved successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "data": {
+              "id": "string (UUID)",
+              "name": "string",
+              "trigger": "string",
+              "steps": "array",
+              "createdAt": "ISO string timestamp",
+              "updatedAt": "ISO string timestamp"
+            }
+          }
+        },
+        "404": {
+          "description": "Flow not found",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/action-flows/:flowId",
+      "method": "PUT",
+      "description": "Update an existing action flow",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "flowId",
+          "in": "path",
+          "description": "UUID of the flow to update",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "name",
+          "in": "body",
+          "description": "Name of the flow",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "trigger",
+          "in": "body",
+          "description": "Message trigger that activates the flow",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "steps",
+          "in": "body",
+          "description": "Array of step objects defining the flow actions",
+          "required": true,
+          "type": "array"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Flow updated successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "message": "string",
+            "data": {
+              "id": "string (UUID)",
+              "name": "string",
+              "trigger": "string",
+              "steps": "array",
+              "updatedAt": "ISO string timestamp"
+            }
+          }
+        },
+        "400": {
+          "description": "Invalid flow data",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "404": {
+          "description": "Flow not found",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/action-flows/:flowId",
+      "method": "DELETE",
+      "description": "Delete an action flow",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "flowId",
+          "in": "path",
+          "description": "UUID of the flow to delete",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Flow deleted successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "message": "string"
+          }
+        },
+        "404": {
+          "description": "Flow not found",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/agents",
+      "method": "GET",
+      "description": "Get all conversational agents for a user",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Agents retrieved successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "data": [
+              {
+                "id": "string (UUID)",
+                "persona": {
+                  "name": "string",
+                  "role": "string",
+                  "language": "string",
+                  "tone": "string",
+                  "style": "string",
+                  "guidelines": "array"
+                },
+                "knowledge": {
+                  "files": "array",
+                  "urls": "array",
+                  "qandas": "array"
+                },
+                "createdAt": "timestamp",
+                "updatedAt": "timestamp"
+              }
+            ]
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/agents",
+      "method": "POST",
+      "description": "Create a new conversational agent for a user",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "persona",
+          "in": "body",
+          "description": "Personality configuration for the agent",
+          "required": true,
+          "type": "object",
+          "schema": {
+            "name": "string (required)",
+            "role": "string",
+            "language": "string",
+            "tone": "string",
+            "style": "string",
+            "guidelines": "array"
+          }
+        },
+        {
+          "name": "knowledge",
+          "in": "body",
+          "description": "Knowledge base for the agent",
+          "required": true,
+          "type": "object",
+          "schema": {
+            "files": "array",
+            "urls": "array",
+            "qandas": "array"
+          }
+        }
+      ],
+      "responses": {
+        "201": {
+          "description": "Agent created successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "message": "string",
+            "data": {
+              "id": "string (UUID)",
+              "persona": "object",
+              "knowledge": "object",
+              "createdAt": "timestamp",
+              "updatedAt": "timestamp"
+            }
+          }
+        },
+        "400": {
+          "description": "Invalid agent data",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "404": {
+          "description": "User not found",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/agents/:agentId",
+      "method": "GET",
+      "description": "Get a specific conversational agent",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "agentId",
+          "in": "path",
+          "description": "UUID of the agent to retrieve",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Agent retrieved successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "data": {
+              "id": "string (UUID)",
+              "persona": "object",
+              "knowledge": "object"
+            }
+          }
+        },
+        "404": {
+          "description": "Agent not found",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/agents/:agentId",
+      "method": "PUT",
+      "description": "Update an existing conversational agent",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "agentId",
+          "in": "path",
+          "description": "UUID of the agent to update",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "persona",
+          "in": "body",
+          "description": "Personality configuration for the agent",
+          "required": true,
+          "type": "object"
+        },
+        {
+          "name": "knowledge",
+          "in": "body",
+          "description": "Knowledge base for the agent",
+          "required": true,
+          "type": "object"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Agent updated successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "message": "string",
+            "data": {
+              "id": "string (UUID)",
+              "persona": "object",
+              "knowledge": "object"
+            }
+          }
+        },
+        "400": {
+          "description": "Invalid agent data",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "404": {
+          "description": "Agent not found",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/agents/:agentId",
+      "method": "DELETE",
+      "description": "Delete a conversational agent",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "agentId",
+          "in": "path",
+          "description": "UUID of the agent to delete",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Agent deleted successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "message": "string"
+          }
+        },
+        "404": {
+          "description": "Agent not found",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    },
+    {
+      "path": "/users/:userId/active-agent",
+      "method": "PUT",
+      "description": "Set the active conversational agent for a user",
+      "authentication": "Required",
+      "parameters": [
+        {
+          "name": "userId",
+          "in": "path",
+          "description": "Identifier for the user",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "agentId",
+          "in": "body",
+          "description": "UUID of the agent to set as active (or null to use default)",
+          "required": true,
+          "type": "string|null"
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Active agent updated successfully",
+          "schema": {
+            "success": "boolean (true)",
+            "message": "string"
+          }
+        },
+        "404": {
+          "description": "User or agent not found",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        },
+        "500": {
+          "description": "Internal server error",
+          "schema": {
+            "success": "boolean (false)",
+            "message": "string"
+          }
+        }
+      }
+    }
+  ],
+  "websocket": {
+    "endpoint": "ws://{server}:{port}?userId={userId}",
+    "description": "WebSocket connection for real-time updates on WhatsApp connection status, QR codes, and messages",
+    "messages": {
+      "status": {
+        "type": "status",
+        "description": "Status updates for WhatsApp connection",
+        "schema": {
+          "type": "string (status)",
+          "message": "string"
+        }
+      },
+      "qr_code": {
+        "type": "qr_code",
+        "description": "QR code data URL for WhatsApp authentication",
+        "schema": {
+          "type": "string (qr_code)",
+          "qrUrl": "string"
+        }
+      },
+      "ready": {
+        "type": "ready",
+        "description": "Connection ready notification",
+        "schema": {
+          "type": "string (ready)",
+          "message": "string"
+        }
+      },
+      "error": {
+        "type": "error",
+        "description": "Error notification",
+        "schema": {
+          "type": "string (error)",
+          "error": "string"
+        }
+      }
+    }
+  },
+  "workerCommands": {
+    "description": "Internal commands sent between server and worker processes",
+    "commands": [
+      {
+        "name": "SHUTDOWN",
+        "description": "Gracefully shut down the worker"
+      },
+      {
+        "name": "SEND_MESSAGE",
+        "description": "Send a message to a WhatsApp number"
+      },
+      {
+        "name": "RELOAD_FLOWS",
+        "description": "Reload action flows configuration"
+      },
+      {
+        "name": "RELOAD_RULES",
+        "description": "Reload auto-reply rules"
+      },
+      {
+        "name": "RELOAD_STARTERS",
+        "description": "Reload Gemini conversation starters"
+      },
+      {
+        "name": "RELOAD_AGENT_CONFIG",
+        "description": "Reload the active agent configuration"
+      },
+      {
+        "name": "SWITCH_AGENT",
+        "description": "Change the active agent"
+      }
+    ]
+  },
+  "dataModels": {
+    "agent": {
+      "description": "Conversational agent configuration",
+      "schema": {
+        "id": "string (UUID)",
+        "persona": {
+          "name": "string",
+          "role": "string",
+          "language": "string",
+          "tone": "string",
+          "style": "string",
+          "guidelines": "array of string"
+        },
+        "knowledge": {
+          "files": "array of file references",
+          "urls": "array of URLs",
+          "qandas": "array of Q&A pairs"
+        },
+        "createdAt": "timestamp",
+        "updatedAt": "timestamp"
+      }
+    },
+    "rule": {
+      "description": "Auto-reply rule configuration",
+      "schema": {
+        "id": "string (UUID)",
+        "trigger": "string (lowercase)",
+        "response": "string"
+      }
+    },
+    "geminiStarter": {
+      "description": "Gemini conversation starter configuration",
+      "schema": {
+        "id": "string (UUID)",
+        "trigger": "string (lowercase)",
+        "prompt": "string"
+      }
+    },
+    "actionFlow": {
+      "description": "Sequential action flow configuration",
+      "schema": {
+        "id": "string (UUID)",
+        "name": "string",
+        "trigger": "string",
+        "steps": [
+          {
+            "type": "string (message|delay|condition|branch)",
+            "content": "object (depends on step type)"
+          }
+        ],
+        "createdAt": "timestamp",
+        "updatedAt": "timestamp"
+      }
+    },
+    "stepTypes": {
+      "message": {
+        "description": "Send a message step",
+        "schema": {
+          "type": "message",
+          "text": "string (supports variable interpolation with {variables})"
+        }
+      },
+      "delay": {
+        "description": "Wait for a specified time",
+        "schema": {
+          "type": "delay",
+          "milliseconds": "number"
+        }
+      },
+      "condition": {
+        "description": "Evaluate a condition to determine execution path",
+        "schema": {
+          "type": "condition",
+          "condition": {
+            "type": "string (contains|equals|startsWith|endsWith)",
+            "value": "string",
+            "variable": "string (usually message.body)"
+          },
+          "then": "array of steps",
+          "else": "array of steps (optional)"
+        }
+      }
+    }
+  },
+  "integration": {
+    "description": "This API integrates with WhatsApp via the whatsapp-web.js library and uses Gemini AI for intelligent responses",
+    "aiIntegration": {
+      "provider": "Google Generative AI",
+      "model": "gemini-1.5-flash",
+      "features": [
+        "Conversation starters with custom prompts",
+        "Conversational agent persona customization",
+        "Context-aware responses using conversation history"
+      ]
+    }
+  }
+} 
