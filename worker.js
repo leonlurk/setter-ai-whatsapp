@@ -1,3 +1,4 @@
++ console.log(`[Worker ${process.argv[2] || 'UNKNOWN'}] --- SCRIPT WORKER EJECUTÁNDOSE --- Timestamp: ${new Date().toISOString()}`); // <-- LOG DE INICIO
 const path = require('path');
 const fs = require('fs');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js'); // Usar LocalAuth para sesiones persistentes
@@ -7,6 +8,7 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 require('dotenv').config(); // Cargar variables de entorno (ej. GEMINI_API_KEY)
 const { loadData, saveData } = require('./utils'); // Importar desde utils.js
 const admin = require('firebase-admin');
+const https = require('https'); // <-- AÑADIR import para HTTPS
 
 // --- Obtener User ID ---
 const userId = process.argv[2];
@@ -17,8 +19,8 @@ if (!userId) {
 console.log(`[Worker ${userId}] Iniciando worker...`);
 
 // --- Obtener Active Agent ID (pasado como 3er argumento) ---
-let currentAgentId = process.argv[3] || null;
-console.log(`[Worker ${userId}] Active Agent ID inicial: ${currentAgentId || 'Ninguno (usará default)'}`);
+let initialActiveAgentId = process.argv[3] || null;
+// console.log(`[Worker ${userId}] Active Agent ID inicial: ${initialActiveAgentId || 'Ninguno (usará default)'}`); // Log movido
 
 // --- Definición de Rutas y Archivos ---
 const USER_DATA_PATH = path.join(__dirname, 'data_v2', userId);
@@ -39,17 +41,25 @@ console.log(`[Worker ${userId}] Preparando configuración inicial (esperando dat
 
 // Configuración por defecto para el agente
 const DEFAULT_AGENT_CONFIG = {
+    id: null, // Añadir ID null para el default
     persona: { name: "Agente IA (Default)", role: "Asistente", language: "es", tone: "Neutral", style: "Directo", guidelines: [] },
-    knowledge: { files: [], urls: [], qandas: [] }
+    knowledge: { files: [], urls: [], qandas: [], writingSampleTxt: '' }
 };
 
-// Variable para almacenar la configuración del agente ACTIVO
-let agentConfig = { ...DEFAULT_AGENT_CONFIG }; // Iniciar con el default
+// <<< NUEVO: Objeto centralizado para el estado del agente activo >>>
+let currentAgentState = {
+    id: initialActiveAgentId, // Usar el ID inicial pasado como argumento
+    config: {
+        ...DEFAULT_AGENT_CONFIG,
+        knowledge: { ...DEFAULT_AGENT_CONFIG.knowledge, writingSampleTxt: '' } // Asegurar que knowledge y writingSampleTxt existen
+    } // Empezar con la configuración por defecto
+};
+console.log(`[Worker ${userId}] Estado inicial del agente: ID=${currentAgentState.id || 'ninguno'}, ConfigName=${currentAgentState.config.persona.name}`);
 
 // Variables para almacenar reglas y flujos
-let autoReplyRules = []; // Reglas simples de respuesta automática
-let geminiConversationStarters = []; // Starters de conversación con Gemini
-let actionFlows = []; // Flujos de acción
+let autoReplyRules = [];
+let geminiConversationStarters = [];
+let actionFlows = [];
 
 // <<< ADDED: Firestore Initialization for Worker >>>
 let firestoreDbWorker;
@@ -77,6 +87,30 @@ try {
     process.exit(1);
 }
 // <<< END: Firestore Initialization for Worker >>>
+
+// <<< ADDED: Función para cargar flujos de acción desde Firestore >>>
+async function loadActionFlowsFromFirestore() {
+    if (!firestoreDbWorker || !userId) {
+        console.error(`[Worker ${userId}][Flow Load] Firestore DB o User ID no disponibles. No se pueden cargar flujos.`);
+        actionFlows = []; // Asegurar que esté vacío si falla
+        return;
+    }
+    console.log(`[Worker ${userId}][Flow Load] Cargando flujos de acción desde Firestore...`);
+    try {
+        const flowsSnapshot = await firestoreDbWorker.collection('users').doc(userId).collection('action_flows').get();
+        const loadedFlows = flowsSnapshot.docs.map(doc => {
+            // Podríamos añadir validación de la estructura del flujo aquí si es necesario
+            return doc.data();
+        });
+        actionFlows = loadedFlows;
+        console.log(`[Worker ${userId}][Flow Load] ${actionFlows.length} flujos de acción cargados.`);
+    } catch (error) {
+        console.error(`[Worker ${userId}][Flow Load] Error cargando flujos de acción desde Firestore:`, error);
+        sendErrorInfo(`Error cargando flujos: ${error.message}`);
+        actionFlows = []; // Dejar vacío en caso de error
+    }
+}
+// <<< END: Función para cargar flujos de acción desde Firestore >>>
 
 // <<< ADDED: Function to update status in Firestore >>>
 async function updateFirestoreStatus(statusData) {
@@ -111,6 +145,7 @@ async function updateFirestoreStatus(statusData) {
 // <<< END: Function to update status in Firestore >>>
 
 // <<< ADDED: Gemini Initialization with try...catch >>>
+let geminiModel; // Declare outside try...catch
 try {
     const geminiApiKey = process.env.GEMINI_API_KEY;
     if (!geminiApiKey) {
@@ -412,7 +447,7 @@ async function executeSteps(stepsToExecute, context) {
                                 promptToUse = await buildPromptWithHistory(
                                     context.message.from,
                                     resolvedPrompt, // Usamos el prompt resuelto como el "mensaje actual"
-                                    agentConfig.persona
+                                    //context.flow.variables  //<- This was passed before, but buildPromptWithHistory now reads global state
                                 );
                                 console.log(`   -> [Flow Gemini] Usando prompt con historial de conversación`);
                             } catch (historyError) {
@@ -502,7 +537,8 @@ async function executeActionFlow(message, flow) {
             messageBody: message.body,
             timestamp: new Date().toISOString(),
             // Valores recuperados de la sesión
-            user: { name: agentConfig.persona?.name || 'Asistente' }
+            // Read from global state instead of passing directly in context
+            user: { name: currentAgentState.config.persona?.name || 'Asistente' }
         };
 
         // Verificar si el flujo tiene pasos
@@ -702,215 +738,242 @@ client.on('change_battery', batteryInfo => {
 
 // Monitorear TODOS los tipos de mensajes
 client.on('message', async (message) => {
-  // <<< AÑADIR ESTOS LOGS EXTENSIVOS AL INICIO DEL EVENTO >>>
-  console.log(`
+    // <<< LEER LA BANDERA GLOBAL AL INICIO DEL HANDLER >>>
+    // let shouldClearHistoryForThisMessage = agentJustSwitched; // <-- Flag removed
+    // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+    // <<< AÑADIR ESTOS LOGS EXTENSIVOS AL INICIO DEL EVENTO >>>
+    console.log(`
 [Worker ${userId}][MESSAGE EVENT v2] ====== NUEVO MENSAJE DETECTADO ======`);
-  console.log(`[Worker ${userId}][MESSAGE EVENT v2] Timestamp: ${new Date().toISOString()}`);
-  console.log(`[Worker ${userId}][MESSAGE EVENT v2] Message ID: ${message.id?.id || 'unknown'}`);
-  console.log(`[Worker ${userId}][MESSAGE EVENT v2] From: ${message.from || 'unknown'}`);
-  console.log(`[Worker ${userId}][MESSAGE EVENT v2] To: ${message.to || 'unknown'}`);
-  console.log(`[Worker ${userId}][MESSAGE EVENT v2] FromMe: ${message.fromMe}`);
-  console.log(`[Worker ${userId}][MESSAGE EVENT v2] Body: "${message.body?.substring(0, 100)}..."`);
-  console.log(`[Worker ${userId}][MESSAGE EVENT v2] HasMedia: ${!!message.hasMedia}`);
-  console.log(`[Worker ${userId}][MESSAGE EVENT v2] IsGroup: ${message.id?.remote?.endsWith('@g.us') || false}`);
+    console.log(`[Worker ${userId}][MESSAGE EVENT v2] Timestamp: ${new Date().toISOString()}`);
+    console.log(`[Worker ${userId}][MESSAGE EVENT v2] Message ID: ${message.id?.id || 'unknown'}`);
+    console.log(`[Worker ${userId}][MESSAGE EVENT v2] From: ${message.from || 'unknown'}`);
+    console.log(`[Worker ${userId}][MESSAGE EVENT v2] To: ${message.to || 'unknown'}`);
+    console.log(`[Worker ${userId}][MESSAGE EVENT v2] FromMe: ${message.fromMe}`);
+    console.log(`[Worker ${userId}][MESSAGE EVENT v2] Body: "${message.body?.substring(0, 100)}..."`);
+    console.log(`[Worker ${userId}][MESSAGE EVENT v2] HasMedia: ${!!message.hasMedia}`);
+    console.log(`[Worker ${userId}][MESSAGE EVENT v2] IsGroup: ${message.id?.remote?.endsWith('@g.us') || false}`);
 
-  // <<< VERIFICAR SI PUPPETEER SIGUE FUNCIONANDO >>>
-  try {
-    if (!client.pupBrowser || !client.pupPage) {
-      console.error(`[Worker ${userId}][ERROR CRÍTICO] Puppeteer browser/page no disponible en evento message. Browser: ${!!client.pupBrowser}, Page: ${!!client.pupPage}`);
-      sendErrorInfo(`Puppeteer no disponible al procesar mensaje. Es posible que se haya desconectado.`);
-    } else {
-      console.log(`[Worker ${userId}][PUPPETEER STATUS] Browser: OK, Page: OK`);
+    // <<< VERIFICAR SI PUPPETEER SIGUE FUNCIONANDO >>>
+    try {
+      if (!client.pupBrowser || !client.pupPage) {
+        console.error(`[Worker ${userId}][ERROR CRÍTICO] Puppeteer browser/page no disponible en evento message. Browser: ${!!client.pupBrowser}, Page: ${!!client.pupPage}`);
+        sendErrorInfo(`Puppeteer no disponible al procesar mensaje. Es posible que se haya desconectado.`);
+      } else {
+        console.log(`[Worker ${userId}][PUPPETEER STATUS] Browser: OK, Page: OK`);
+      }
+    } catch (puppeteerCheckError) {
+      console.error(`[Worker ${userId}][ERROR CRÍTICO] Error verificando estado Puppeteer:`, puppeteerCheckError);
     }
-  } catch (puppeteerCheckError) {
-    console.error(`[Worker ${userId}][ERROR CRÍTICO] Error verificando estado Puppeteer:`, puppeteerCheckError);
-  }
 
-  const sender = message.from;
-  const isFromMe = message.fromMe;
+    const sender = message.from;
+    const isFromMe = message.fromMe;
 
-  // Ignorar procesar mensajes de grupos si el tipo de mensaje no es soportado
-  if (sender.endsWith('@g.us')) {
-    console.log(`[Worker ${userId}][MESSAGE EVENT v2] Mensaje de grupo detectado. No procesando por ahora.`);
-    return;
-  }
+    // Ignorar procesar mensajes de grupos si el tipo de mensaje no es soportado
+    if (sender.endsWith('@g.us')) {
+      console.log(`[Worker ${userId}][MESSAGE EVENT v2] Mensaje de grupo detectado. No procesando por ahora.`);
+      return;
+    }
 
-  // Manejar mensajes multimedia: por ahora solo loguear
-  if (message.hasMedia) {
-    console.log(`[Worker ${userId}][MESSAGE EVENT v2] Mensaje con multimedia detectado:`, message.type);
-    // En una versión futura, podrías descargar y procesar media
-    // Por ahora, continuamos procesando como mensaje normal y solo usamos el body
-  }
+    // Manejar mensajes multimedia: por ahora solo loguear
+    if (message.hasMedia) {
+      console.log(`[Worker ${userId}][MESSAGE EVENT v2] Mensaje con multimedia detectado:`, message.type);
+      // En una versión futura, podrías descargar y procesar media
+      // Por ahora, continuamos procesando como mensaje normal y solo usamos el body
+    }
 
-  const chatPartnerId = message.to;
-  // Asegurar que existen las colecciones necesarias para este chat
-  await ensureChatCollections(chatPartnerId);
+    // Determine chatPartnerId based on whether it's incoming or outgoing
+    // Note: `to` on incoming messages is the bot's number, `from` is the contact
+    // `to` on outgoing messages is the contact, `from` is the bot's number (handled by message_create)
+    const chatPartnerId = isFromMe ? message.to : message.from;
 
-  // Obtener timestamp único para todas las operaciones
-  const serverTimestamp = admin.firestore.FieldValue.serverTimestamp();
+    // Asegurar que existen las colecciones necesarias para este chat
+    await ensureChatCollections(chatPartnerId);
 
-  // Referencias Firestore
-  const chatDocRef = firestoreDbWorker.collection('users').doc(userId).collection('chats').doc(chatPartnerId);
-  const allMessagesColRef = chatDocRef.collection('messages_all');
-  const humanMessagesColRef = chatDocRef.collection('messages_human');
-  const botMessagesColRef = chatDocRef.collection('messages_bot');
-  const contactMessagesColRef = chatDocRef.collection('messages_contact');
+    // Obtener timestamp único para todas las operaciones
+    const serverTimestamp = admin.firestore.FieldValue.serverTimestamp();
 
-  // === PROCESAMIENTO SEGÚN EL ORIGEN ===
-  try {
-    if (isFromMe) {
-      // CASO 1: Mensaje saliente (de mí)
-      // Estos deberían manejarse principalmente en message_create
-      // Aquí solo los guardamos como respaldo
-      console.log(`[Worker ${userId}][MESSAGE EVENT v2] Procesando mensaje saliente (isFromMe=true)...`);
-      // Nota: Este mensaje PUEDE ser del bot, message_create debería haber manejado
-      // los mensajes genuinos del usuario. Por precaución, solo lo guardamos en messages_all
-      await allMessagesColRef.add({
-        body: message.body,
-        timestamp: serverTimestamp,
-        isFromMe: true,
-        messageId: message.id.id,
-        from: `me (${userId}) - via message event`,
-        to: chatPartnerId,
-        // Sin especificar origin para evitar confusión
-      });
+    // Referencias Firestore
+    const chatDocRef = firestoreDbWorker.collection('users').doc(userId).collection('chats').doc(chatPartnerId);
+    const allMessagesColRef = chatDocRef.collection('messages_all');
+    const humanMessagesColRef = chatDocRef.collection('messages_human');
+    const botMessagesColRef = chatDocRef.collection('messages_bot');
+    const contactMessagesColRef = chatDocRef.collection('messages_contact');
 
-      console.log(`[Worker ${userId}][MESSAGE EVENT v2] Mensaje saliente guardado en messages_all (como respaldo).`);
+    // === PROCESAMIENTO SEGÚN EL ORIGEN ===
+    try {
+      if (isFromMe) {
+        // This case should generally be handled by 'message_create' now.
+        // If a message from the bot itself triggers 'message', log a warning.
+        console.warn(`[Worker ${userId}][MESSAGE EVENT v2] ⚠️ Evento 'message' disparado para mensaje saliente (fromMe=true). Esto debería ser manejado por 'message_create'. ID: ${message.id?.id}`);
+        // Do NOT reset the flag here as it's removed
+        return; // Exit if it's an outgoing message that slipped through
+      } else {
+        // CASO 2: Mensaje entrante (de otra persona)
+        console.log(`[Worker ${userId}][MESSAGE EVENT v2] Procesando mensaje entrante (isFromMe=false)...`);
 
-      // No actualizamos estado de actividad aquí para evitar conflictos con message_create
-      return; // IMPORTANTE: Salir aquí para no procesar auto-respuestas a mensajes propios
-    } else {
-      // CASO 2: Mensaje entrante (de otra persona)
-      console.log(`[Worker ${userId}][MESSAGE EVENT v2] Procesando mensaje entrante (isFromMe=false)...`);
-
-      // Guardar en messages_contact
-      await contactMessagesColRef.add({
-        body: message.body,
-        timestamp: serverTimestamp,
-        isFromMe: false,
-        messageId: message.id.id,
-        from: chatPartnerId,
-        to: `me (${userId})`,
-        origin: 'contact'
-      });
-
-      // Guardar en messages_all
-      await allMessagesColRef.add({
-        body: message.body,
-        timestamp: serverTimestamp,
-        isFromMe: false,
-        messageId: message.id.id,
-        from: chatPartnerId,
-        to: `me (${userId})`,
-        origin: 'contact'
-      });
-
-      // Actualizar documento del chat
-      await chatDocRef.set({
-        lastContactMessageTimestamp: serverTimestamp,
-        lastMessageTimestamp: serverTimestamp,
-        lastMessageContent: message.body
-      }, { merge: true });
-
-      console.log(`[Worker ${userId}][MESSAGE EVENT v2] Mensaje entrante guardado en messages_contact y messages_all.`);
-
-
-      // --- Verificar si el usuario está activo para decidir si responder automáticamente ---
-      console.log(`[Worker ${userId}][PRESENCE CHECK v2] Verificando actividad...`);
-      const userIsActive = await isUserActiveInChat(userId, sender);
-      console.log(`[Worker ${userId}][PRESENCE CHECK v2] Resultado: ${userIsActive ? 'ACTIVO' : 'INACTIVO'} (${userIsActive ? 'no responder automáticamente' : 'responder automáticamente'})`);
-
-      // Si el usuario está inactivo, procesar respuestas automáticas
-      if (!userIsActive) {
-        console.log(`[Worker ${userId}][AUTO-REPLY v2] Usuario INACTIVO. Procesando posibles respuestas automáticas para: ${sender}`);
-
-
-        // 1. Verificar si hay un flujo activado por el mensaje
-        const matchedFlow = actionFlows.find(flow => {
-          const messageTextLower = message.body.trim().toLowerCase();
-          const triggerTextLower = flow.trigger?.trim().toLowerCase();
-          return messageTextLower === triggerTextLower;
+        // Guardar en messages_contact
+        await contactMessagesColRef.add({
+          body: message.body,
+          timestamp: serverTimestamp,
+          isFromMe: false,
+          messageId: message.id.id,
+          from: chatPartnerId,
+          to: `me (${userId})`,
+          origin: 'contact'
         });
 
-        if (matchedFlow) {
-          console.log(`[Worker ${userId}][AUTO-REPLY v2] Encontrado flujo coincidente: ${matchedFlow.name} (ID: ${matchedFlow.id}). Ejecutando...`);
-          await executeActionFlow(message, matchedFlow);
-          return; // Terminar aquí si se ejecutó un flujo
-        }
-
-        // 2. Verificar si hay una regla simple que coincida
-        const matchingSimpleRule = autoReplyRules.find(rule => {
-          const messageTextInternal = message.body.trim().toLowerCase();
-          const triggerText = rule.trigger.trim().toLowerCase();
-          return messageTextInternal.includes(triggerText) || messageTextInternal === triggerText;
+        // Guardar en messages_all
+        await allMessagesColRef.add({
+          body: message.body,
+          timestamp: serverTimestamp,
+          isFromMe: false,
+          messageId: message.id.id,
+          from: chatPartnerId,
+          to: `me (${userId})`,
+          origin: 'contact'
         });
 
-        if (matchingSimpleRule) {
-          console.log(`[Worker ${userId}][AUTO-REPLY v2] Encontrada regla simple coincidente. Respondiendo: "${matchingSimpleRule.response}"`);
-          await randomDelay();
-          // Usar la nueva función unificada para enviar mensajes del bot
-          await sendBotMessage(sender, matchingSimpleRule.response, "Auto");
-          return; // Terminar aquí si se ejecutó una regla simple
-        }
+        // Actualizar documento del chat
+        await chatDocRef.set({
+          lastContactMessageTimestamp: serverTimestamp,
+          lastMessageTimestamp: serverTimestamp,
+          lastMessageContent: message.body
+        }, { merge: true });
 
-        // 3. Verificar si hay un starter de conversación Gemini
-        const matchedStarter = geminiConversationStarters.find(starter => {
-          const messageTextInternal = message.body.trim().toLowerCase();
-          const triggerText = starter.trigger.trim().toLowerCase();
-          return messageTextInternal.includes(triggerText) || messageTextInternal === triggerText;
-        });
+        console.log(`[Worker ${userId}][MESSAGE EVENT v2] Mensaje entrante guardado en messages_contact y messages_all.`);
 
-        if (matchedStarter) {
-          console.log(`[Worker ${userId}][AUTO-REPLY v2] Encontrado starter Gemini: "${matchedStarter.trigger}". Generando respuesta...`);
 
-          try {
-            // Usar prompts específicos de starters
-            const result = await callGeminiWithRetry(matchedStarter.prompt);
-            if (result) {
-              console.log(`[Worker ${userId}][AUTO-REPLY v2] Respuesta Gemini Starter generada: "${result.substring(0, 50)}..."`);
-              await randomDelay();
-              // Usar la nueva función unificada para enviar mensajes del bot
-              await sendBotMessage(sender, result, "IA");
-            } else {
-              console.warn(`[Worker ${userId}][AUTO-REPLY v2] Gemini no generó respuesta para starter.`);
-              // Si falla, caer al gemini default más abajo
+        // --- Verificar si el usuario está activo para decidir si responder automáticamente ---
+        console.log(`[Worker ${userId}][PRESENCE CHECK v2] Verificando actividad...`);
+        const userIsActive = await isUserActiveInChat(userId, sender);
+        console.log(`[Worker ${userId}][PRESENCE CHECK v2] Resultado: ${userIsActive ? 'ACTIVO' : 'INACTIVO'} (${userIsActive ? 'no responder automáticamente' : 'responder automáticamente'})`);
+
+        // Si el usuario está inactivo, procesar respuestas automáticas
+        if (!userIsActive) {
+          console.log(`[Worker ${userId}][AUTO-REPLY v2] Usuario INACTIVO. Procesando posibles respuestas automáticas para: ${sender}`);
+
+
+          // 1. Verificar si hay un flujo activado por el mensaje
+          const matchedFlow = actionFlows.find(flow => {
+            const messageTextLower = message.body.trim().toLowerCase();
+            // Obtener el tipo y valor del disparador del flujo
+            const triggerType = flow.trigger;
+            const triggerValueLower = flow.triggerValue?.trim().toLowerCase();
+
+            // Validar triggerValue SOLO si es necesario para el tipo de trigger
+            if ((triggerType === 'message' || triggerType === 'exact_message') && !triggerValueLower) {
+              // console.log(`   [Flow Check] Trigger ${triggerType} requires value, but none provided for flow "${flow.name}"`);
+              return false;
             }
-          } catch (geminiError) {
-            console.error(`[Worker ${userId}][AUTO-REPLY v2] Error generando respuesta Gemini para starter:`, geminiError);
-            // Si falla, caer al gemini default más abajo
+
+            // Aplicar la lógica de coincidencia según el tipo de disparador
+            switch (triggerType) {
+              case 'exact_message':
+                // console.log(`   [Flow Check] Exact: comparing "${messageTextLower}" === "${triggerValueLower}" for flow "${flow.name}"`);
+                return messageTextLower === triggerValueLower;
+              case 'message': // Este es el caso 'contains'
+                // console.log(`   [Flow Check] Contains: checking if "${messageTextLower}" includes "${triggerValueLower}" for flow "${flow.name}"`);
+                return messageTextLower.includes(triggerValueLower);
+              case 'image_received':
+                // console.log(`   [Flow Check] Image: checking if message.hasMedia (${message.hasMedia}) and message.type (${message.type}) === 'image' for flow "${flow.name}"`);
+                return message.hasMedia && message.type === 'image';
+              default:
+                // console.log(`   [Flow Check] Unknown trigger type "${triggerType}" for flow "${flow.name}"`);
+                return false; // Tipo de disparador no reconocido
+            }
+          });
+
+          if (matchedFlow) {
+            console.log(`[Worker ${userId}][AUTO-REPLY v2] Encontrado flujo coincidente (${matchedFlow.trigger}): ${matchedFlow.name} (ID: ${matchedFlow.id}). Ejecutando...`);
+            await executeActionFlow(message, matchedFlow);
+            // Flag removed - no reset needed
+            return; // Terminar aquí si se ejecutó un flujo
           }
-          return; // Terminar aquí aunque haya fallado (no tratar de procesar más)
-        }
 
-        // 4. Respuesta default de Gemini (si todo lo anterior falló)
-        // En una implementación futura, buscar historial de mensajes para contexto.
-        console.log(`[Worker ${userId}][AUTO-REPLY v2] Sin coincidencias específicas, usando respuesta default con Gemini...`);
-        // Usar la función de historial de conversación en lugar del contexto default
-        try {
-            // Construir prompt con historial de conversación
-            const promptWithHistory = await buildPromptWithHistory(message.from, message.body, agentConfig.persona);
-            console.log(`[Worker ${userId}][AUTO-REPLY v2] Prompt con historial generado. Enviando a Gemini...`);
+          // 2. Verificar si hay una regla simple que coincida
+          const matchingSimpleRule = autoReplyRules.find(rule => {
+            const messageTextInternal = message.body.trim().toLowerCase();
+            const triggerText = rule.trigger.trim().toLowerCase();
+            return messageTextInternal.includes(triggerText) || messageTextInternal === triggerText;
+          });
 
-            const result = await callGeminiWithRetry(promptWithHistory, message.from); // Pasar el chatId
-            if (result) {
-                console.log(`[Worker ${userId}][AUTO-REPLY v2] Respuesta Gemini con contexto generada: "${result.substring(0, 50)}..."`);
+          if (matchingSimpleRule) {
+            console.log(`[Worker ${userId}][AUTO-REPLY v2] Encontrada regla simple coincidente. Respondiendo: "${matchingSimpleRule.response}"`);
+            await randomDelay();
+            // Usar la nueva función unificada para enviar mensajes del bot
+            await sendBotMessage(sender, matchingSimpleRule.response, "Auto");
+            // Flag removed - no reset needed
+            return; // Terminar aquí si se ejecutó una regla simple
+          }
+
+          // 3. Verificar si hay un starter de conversación Gemini
+          const matchedStarter = geminiConversationStarters.find(starter => {
+            const messageTextInternal = message.body.trim().toLowerCase();
+            const triggerText = starter.trigger.trim().toLowerCase();
+            return messageTextInternal.includes(triggerText) || messageTextInternal === triggerText;
+          });
+
+          if (matchedStarter) {
+            console.log(`[Worker ${userId}][AUTO-REPLY v2] Encontrado starter Gemini: "${matchedStarter.trigger}". Generando respuesta...`);
+
+            try {
+              // Starters usually don't need history/persona context from the active agent state
+              const result = await callGeminiWithRetry(matchedStarter.prompt);
+              if (result) {
+                console.log(`[Worker ${userId}][AUTO-REPLY v2] Respuesta Gemini Starter generada: "${result.substring(0, 50)}..."`);
                 await randomDelay();
                 // Usar la nueva función unificada para enviar mensajes del bot
                 await sendBotMessage(sender, result, "IA");
-            } else {
-                console.warn(`[Worker ${userId}][AUTO-REPLY v2] Gemini no generó respuesta con contexto.`);
+              } else {
+                console.warn(`[Worker ${userId}][AUTO-REPLY v2] Gemini no generó respuesta para starter.`);
+              }
+            } catch (geminiError) {
+              console.error(`[Worker ${userId}][AUTO-REPLY v2] Error generando respuesta Gemini para starter:`, geminiError);
             }
-        } catch (geminiError) {
-            console.error(`[Worker ${userId}][AUTO-REPLY v2] Error generando respuesta Gemini con contexto:`, geminiError);
+            // Flag removed - no reset needed
+            return; // Terminar aquí (no caer al default Gemini)
+          }
+
+
+          // 4. Respuesta default de Gemini
+          console.log(`[Worker ${userId}][AUTO-REPLY v2] Sin coincidencias específicas, usando respuesta default con Gemini...`);
+          try {
+              // <<< LEER ESTADO AQUÍ ARRIBA DE NUEVO >>>
+              console.log(`[Worker ${userId}][AUTO-REPLY v2] ===> State Check BEFORE persona extraction: currentAgentState.id=${currentAgentState.id}, configName=${currentAgentState.config?.persona?.name}`);
+              console.log(`[Worker ${userId}][AUTO-REPLY v2] ===> Full currentAgentState.config:`, JSON.stringify(currentAgentState.config));
+              const personaActualParaLog = currentAgentState.config.persona; // Solo para loguear aquí
+              console.log(`[Worker ${userId}][AUTO-REPLY v2] Leyendo personaActual (para log) JUSTO ANTES de llamar a buildPrompt:`, JSON.stringify(personaActualParaLog));
+
+              // <<< NO PASAR personaActual, buildPrompt leerá el estado global >>>
+              const promptWithHistory = await buildPromptWithHistory(message.from, message.body);
+              console.log(`[Worker ${userId}][AUTO-REPLY v2] Prompt generado. Enviando a Gemini...`);
+
+              const result = await callGeminiWithRetry(promptWithHistory, message.from);
+              if (result) {
+                  console.log(`[Worker ${userId}][AUTO-REPLY v2] Respuesta Gemini con contexto generada: "${result.substring(0, 50)}..."`);
+                  await randomDelay();
+                  // Usar la nueva función unificada para enviar mensajes del bot
+                  await sendBotMessage(sender, result, "IA");
+              } else {
+                  console.warn(`[Worker ${userId}][AUTO-REPLY v2] Gemini no generó respuesta con contexto.`);
+              }
+              // Flag removed - no reset needed
+
+          } catch (geminiError) {
+              console.error(`[Worker ${userId}][AUTO-REPLY v2] Error generando respuesta Gemini:`, geminiError);
+              // Flag removed - no reset needed
+          }
+        } else {
+          console.log(`[Worker ${userId}][AUTO-REPLY v2] Usuario ACTIVO. No se enviarán respuestas automáticas.`);
+          // Flag removed - no reset needed
         }
-      } else {
-        console.log(`[Worker ${userId}][AUTO-REPLY v2] Usuario ACTIVO. No se enviarán respuestas automáticas.`);
       }
+    } catch (dbError) {
+      console.error(`[Worker ${userId}][MESSAGE EVENT v2] Error procesando mensaje:`, dbError);
+      sendErrorInfo(`Error procesando mensaje: ${dbError.message}`);
+      // Flag removed - no reset needed
     }
-  } catch (dbError) {
-    console.error(`[Worker ${userId}][MESSAGE EVENT v2] Error procesando mensaje:`, dbError);
-    sendErrorInfo(`Error procesando mensaje: ${dbError.message}`);
-  }
 });
 
 client.on('message_revoke_everyone', async (after, before) => {
@@ -925,7 +988,7 @@ client.on('message_ack', async (message, ack) => {
 // === MANEJO DE COMANDOS IPC DEL MASTER ===
 let isShuttingDown = false;
 
-process.on('message', (message) => {
+process.on('message', async (message) => { // <-- Convertido a async para poder usar await
     // --- Log AÑADIDO para depurar recepción ---
     console.log(`[Worker ${userId}] ===> process.on('message') RECIBIDO:`, JSON.stringify(message));
 
@@ -936,73 +999,123 @@ process.on('message', (message) => {
 
     console.log(`[IPC Worker ${userId}] Comando recibido del Master (Tipo: ${message.type}):`, message);
 
+    // Flag removed - no reset logic needed
     switch (message.type) {
         case 'COMMAND':
+            // Let handleCommand manage the flag if it includes SWITCH_AGENT
             handleCommand(message.command, message.payload);
             break;
         case 'SWITCH_AGENT':
-            console.log(`[Worker ${userId}] Recibido comando para cambiar agente activo...`, message.payload);
+            console.log(`[Worker ${userId}][IPC] Recibido comando SWITCH_AGENT. Payload:`, JSON.stringify(message.payload));
             const switchPayload = message.payload;
-            currentAgentId = switchPayload?.agentId || null;
-            console.log(`[Worker ${userId}] ID de agente activo establecido a: ${currentAgentId || 'Ninguno (default)'}.`);
+            const newAgentId = switchPayload?.agentId || null;
+            const newAgentConfig = switchPayload?.agentConfig;
 
-            if (switchPayload?.agentConfig) {
-                agentConfig = switchPayload.agentConfig;
-                console.log(`   -> Configuración de agente actualizada desde payload SWITCH_AGENT para: ${agentConfig.persona?.name || currentAgentId}`);
-            } else if (!currentAgentId) {
-                agentConfig = { ...DEFAULT_AGENT_CONFIG }; // Volver a default si ID es null y no vino config
-                console.log(`   -> Usando configuración de agente por defecto (ID es null).`);
+            // <<< ACTUALIZAR ESTADO CENTRALIZADO >>>
+            currentAgentState.id = newAgentId;
+            console.log(`[Worker ${userId}][IPC] ID de agente activo interno establecido a: ${currentAgentState.id || 'Ninguno (default)'}.`);
+
+            if (newAgentConfig) {
+                // <<< CHANGE: Use deep copy for agent config >>>
+                // <<< MODIFIED: Ensure knowledge structure exists >>>
+                currentAgentState.config = JSON.parse(JSON.stringify(newAgentConfig));
+                if (!currentAgentState.config.knowledge) {
+                    currentAgentState.config.knowledge = { ...DEFAULT_AGENT_CONFIG.knowledge, writingSampleTxt: '' };
+                } else if (currentAgentState.config.knowledge.writingSampleTxt === undefined) {
+                    currentAgentState.config.knowledge.writingSampleTxt = '';
+                }
+                 // Ensure files array exists
+                 if (!currentAgentState.config.knowledge.files) {
+                     currentAgentState.config.knowledge.files = [];
+                 }
+                console.log(`[Worker ${userId}][IPC] Configuración de agente actualizada desde payload SWITCH_AGENT.`);
+            } else if (!currentAgentState.id) {
+                // <<< CHANGE: Use deep copy for default config >>>
+                currentAgentState.config = JSON.parse(JSON.stringify({
+                    ...DEFAULT_AGENT_CONFIG,
+                    knowledge: { ...DEFAULT_AGENT_CONFIG.knowledge, writingSampleTxt: '', files: [] } // Ensure files array
+                })); // Volver a default si ID es null y no vino config
+                console.log(`[Worker ${userId}][IPC] Usando configuración de agente por defecto (ID null, sin config en payload).`);
             } else {
-                // No vino config en el payload, pero hay un agentId. Se usará la config que ya tenga cargada
-                // (posiblemente de INITIAL_CONFIG o un RELOAD anterior). Loguear advertencia.
-                console.warn(`   -> SWITCH_AGENT recibido para ${currentAgentId} SIN payload de config. Se usará la config en memoria si existe.`);
-                // En este punto, agentConfig NO se modifica.
+                // Este caso es problemático: se cambió a un ID pero no vino la config.
+                console.warn(`[Worker ${userId}][IPC] SWITCH_AGENT recibido para ${currentAgentState.id} SIN payload de config. ¡Se mantendrá la configuración anterior en memoria! (${currentAgentState.config.persona.name})`);
+                // Asegurar estructura knowledge aunque la config sea antigua
+                if (!currentAgentState.config.knowledge) {
+                    currentAgentState.config.knowledge = { ...DEFAULT_AGENT_CONFIG.knowledge, writingSampleTxt: '', files: [] };
+                } else {
+                    if (currentAgentState.config.knowledge.writingSampleTxt === undefined) {
+                        currentAgentState.config.knowledge.writingSampleTxt = '';
+                    }
+                    if (!currentAgentState.config.knowledge.files) {
+                         currentAgentState.config.knowledge.files = [];
+                    }
+                }
             }
+            console.log(`[Worker ${userId}][IPC] Valor final de currentAgentState.config después de SWITCH_AGENT:`, JSON.stringify(currentAgentState.config).substring(0, 300) + '...'); // Log truncado
+
+            // <<< LLAMAR A LA NUEVA FUNCIÓN DE LIMPIEZA >>>
+            console.log(`[Worker ${userId}][IPC] Agente cambiado a ${currentAgentState.id}. Limpiando historial de conversaciones...`);
+            await clearConversationHistories();
+            console.log(`[Worker ${userId}][IPC] Limpieza de historial completada después de SWITCH_AGENT.`);
+            // <<< ELIMINAR SETEO DE BANDERA >>>
             break;
-        case 'INITIAL_CONFIG': // <<< ADDED: Manejar configuración inicial >>>
+        case 'INITIAL_CONFIG':
             console.log(`[Worker ${userId}] Recibida configuración inicial del Master.`);
             const configPayload = message.payload;
             if (configPayload) {
-                agentConfig = configPayload.agentConfig || { ...DEFAULT_AGENT_CONFIG };
-                currentAgentId = agentConfig.id || null;
+                // Establecer config inicial SOLO si no se recibió una específica en SWITCH_AGENT antes
+                // O si el ID del agente en la config inicial coincide con el actual (raro pero posible)
+                if (!currentAgentState.id || (configPayload.agentConfig && configPayload.agentConfig.id === currentAgentState.id)) {
+                    // <<< CHANGE: Use deep copy for agent config >>>
+                    currentAgentState.config = configPayload.agentConfig
+                        ? JSON.parse(JSON.stringify(configPayload.agentConfig))
+                        : JSON.parse(JSON.stringify(DEFAULT_AGENT_CONFIG));
+                    // Ensure knowledge structure
+                    if (!currentAgentState.config.knowledge) {
+                        currentAgentState.config.knowledge = { ...DEFAULT_AGENT_CONFIG.knowledge, writingSampleTxt: '', files: [] };
+                    } else {
+                        if (currentAgentState.config.knowledge.writingSampleTxt === undefined) currentAgentState.config.knowledge.writingSampleTxt = '';
+                        if (!currentAgentState.config.knowledge.files) currentAgentState.config.knowledge.files = [];
+                    }
+                }
+                // currentAgentState.id ya se estableció a partir de los argumentos iniciales
 
                 autoReplyRules = Array.isArray(configPayload.rules) ? configPayload.rules : [];
                 geminiConversationStarters = Array.isArray(configPayload.starters) ? configPayload.starters : [];
-                actionFlows = Array.isArray(configPayload.flows) ? configPayload.flows : [];
 
-                console.log(`   -> Agent Config Loaded: ${agentConfig.persona?.name || (currentAgentId ? `ID ${currentAgentId}` : 'Default')}`);
+                console.log(`   -> Agent Config Loaded Initial: ${currentAgentState.config.persona?.name || (currentAgentState.id ? `ID ${currentAgentState.id}` : 'Default')}`);
                 console.log(`   -> Rules Loaded: ${autoReplyRules.length}`);
                 console.log(`   -> Starters Loaded: ${geminiConversationStarters.length}`);
-                console.log(`   -> Flows Loaded: ${actionFlows.length}`);
+
+                await loadActionFlowsFromFirestore();
+
             } else {
                 console.warn(`[Worker ${userId}] Mensaje INITIAL_CONFIG recibido SIN payload. Usando defaults.`);
-                agentConfig = { ...DEFAULT_AGENT_CONFIG };
+                // Ya deberían estar en default por la inicialización de currentAgentState
                 autoReplyRules = [];
                 geminiConversationStarters = [];
                 actionFlows = [];
-                currentAgentId = null;
+                await loadActionFlowsFromFirestore();
             }
             break;
         case 'RELOAD_FLOWS':
-            console.log(`[Worker ${userId}] Recibido comando para recargar flujos de acción...`);
-            if (message.payload && Array.isArray(message.payload.flows)) {
-                actionFlows = message.payload.flows;
-                console.log(`   -> Flujos de acción actualizados desde payload. Total: ${actionFlows.length}`);
-            } else {
-                console.warn(`   -> Comando RELOAD_FLOWS recibido sin payload de flujos válido. No se puede actualizar.`);
-            }
-            break;
-        case 'RELOAD_RULES': // <<< ADDED
-            console.log(`[Worker ${userId}] Recibido comando RELOAD_RULES.`);
+             console.warn(`[Worker ${userId}] Recibido comando obsoleto 'RELOAD_FLOWS'. Ignorando. Usar 'RELOAD_USER_FLOWS'.`);
+             break;
+        case 'RELOAD_USER_FLOWS':
+             console.log(`[Worker ${userId}] Recibido comando para recargar flujos de acción del usuario...`);
+             await loadActionFlowsFromFirestore(); // Simplemente recargamos desde Firestore
+             break;
+        case 'RELOAD_RULES':
+             console.log(`[Worker ${userId}] Recibido comando RELOAD_RULES.`);
             if (message.payload && Array.isArray(message.payload.rules)) {
                 autoReplyRules = message.payload.rules;
                 console.log(`   -> Reglas actualizadas desde payload. Total: ${autoReplyRules.length}`);
             } else {
                 console.warn(`   -> Comando RELOAD_RULES recibido sin payload de reglas válido. No se puede actualizar.`);
             }
-            break;
-        case 'RELOAD_STARTERS': // <<< ADDED
-            console.log(`[Worker ${userId}] Recibido comando RELOAD_STARTERS.`);
+             break;
+        case 'RELOAD_STARTERS':
+             console.log(`[Worker ${userId}] Recibido comando RELOAD_STARTERS.`);
             if (message.payload && Array.isArray(message.payload.starters)) {
                 geminiConversationStarters = message.payload.starters;
                 console.log(`   -> Starters actualizados desde payload. Total: ${geminiConversationStarters.length}`);
@@ -1010,26 +1123,38 @@ process.on('message', (message) => {
                 console.warn(`   -> Comando RELOAD_STARTERS recibido sin payload de starters válido. No se puede actualizar.`);
             }
             break;
-        case 'RELOAD_AGENT_CONFIG': // <<< ADDED
+        case 'RELOAD_AGENT_CONFIG':
              console.log(`[Worker ${userId}] Recibido comando RELOAD_AGENT_CONFIG.`);
-            if (message.payload && message.payload.agentConfig && message.payload.agentConfig.id === currentAgentId) {
-                agentConfig = message.payload.agentConfig;
-                console.log(`   -> Configuración para agente activo (${currentAgentId}) actualizada desde payload.`);
-            } else if (message.payload && message.payload.agentConfig && message.payload.agentConfig.id !== currentAgentId) {
-                 console.warn(`   -> Recibido RELOAD_AGENT_CONFIG para agente ${message.payload.agentConfig.id}, pero el agente activo es ${currentAgentId}. Configuración no aplicada.`);
-             } else if (!message.payload || !message.payload.agentConfig) {
-                console.warn(`   -> Comando RELOAD_AGENT_CONFIG recibido sin payload de config válido. No se puede actualizar.`);
+            // Apply the config only if the ID matches the currently active agent
+            if (message.payload && message.payload.agentConfig && message.payload.agentConfig.id === currentAgentState.id) {
+                console.log(`   -> Aplicando config para agente activo ${currentAgentState.id} desde RELOAD_AGENT_CONFIG.`);
+                const reloadedConfig = JSON.parse(JSON.stringify(message.payload.agentConfig));
+                // Ensure knowledge structure
+                if (!reloadedConfig.knowledge) {
+                    reloadedConfig.knowledge = { ...DEFAULT_AGENT_CONFIG.knowledge, writingSampleTxt: '', files: [] };
+                } else {
+                    if (reloadedConfig.knowledge.writingSampleTxt === undefined) reloadedConfig.knowledge.writingSampleTxt = '';
+                    if (!reloadedConfig.knowledge.files) reloadedConfig.knowledge.files = [];
+                }
+                currentAgentState.config = reloadedConfig;
+            } else if (message.payload && message.payload.agentConfig) {
+                console.warn(`   -> Config en RELOAD_AGENT_CONFIG es para ${message.payload.agentConfig.id}, pero el activo es ${currentAgentState.id}. Ignorando.`);
+            } else {
+                console.warn(`   -> Comando RELOAD_AGENT_CONFIG recibido sin payload válido.`);
             }
             break;
-         // TODO: Añadir case para 'RELOAD_CONFIG' (para otras configs)
-         // ...
         default:
             console.warn(`[IPC Worker ${userId}] Tipo de mensaje no reconocido: ${message.type}`);
     }
+
+    // Flag removed - no reset logic needed
 });
 
+// Modify handleCommand if it also handles SWITCH_AGENT to set the flag
 function handleCommand(command, payload) {
     console.log(`[Worker ${userId}] Procesando comando: ${command}`);
+    // <<< ELIMINAR LÓGICA DE commandRequiresFlagReset >>>
+
     switch (command) {
         case 'SHUTDOWN':
             console.log(`[Worker ${userId}] ===> ENTRANDO al case SHUTDOWN`); // Log inicio case
@@ -1064,29 +1189,52 @@ function handleCommand(command, payload) {
                 console.log(`[Worker ${userId}] ===> Comando SHUTDOWN recibido pero ya estaba en proceso de cierre (isShuttingDown=true).`);
             }
             break;
-        case 'RELOAD_FLOWS':
-            console.log(`[Worker ${userId}] Recibido comando para recargar flujos de acción...`);
-            if (payload && Array.isArray(payload.flows)) {
-                actionFlows = payload.flows;
-                console.log(`   -> Flujos de acción actualizados desde payload. Total: ${actionFlows.length}`);
-            } else {
-                console.warn(`   -> Comando RELOAD_FLOWS recibido sin payload de flujos válido. No se puede actualizar.`);
-            }
+        case 'RELOAD_FLOWS': // <-- ESTE CASO ES OBSOLETO AHORA
+             console.warn(`[Worker ${userId}][handleCommand] Comando obsoleto 'RELOAD_FLOWS' recibido. Ignorando.`);
             break;
-        case 'SWITCH_AGENT':
-            console.log(`[Worker ${userId}] Procesando comando SWITCH_AGENT...`, payload);
-            const newAgentId = payload?.agentId || null;
-            currentAgentId = newAgentId;
-            console.log(`[Worker ${userId}] ID de agente activo establecido a: ${currentAgentId || 'Ninguno (default)'}.`);
-            if (!currentAgentId) {
+        case 'RELOAD_USER_FLOWS': // <<< ADDED: Manejo en handleCommand también por si acaso >>>
+            console.log(`[Worker ${userId}][handleCommand] Recibido comando para recargar flujos de acción del usuario...`);
+            loadActionFlowsFromFirestore(); // Llamar a la función de recarga (no necesita await aquí si no se espera)
+            break;
+        case 'SWITCH_AGENT': // This should be handled by IPC message type, but handle here defensively
+            console.log(`[Worker ${userId}][handleCommand] Procesando comando SWITCH_AGENT...`, payload);
+            const newAgentIdCmd = payload?.agentId || null;
+            currentAgentState.id = newAgentIdCmd;
+            console.log(`[Worker ${userId}][handleCommand] ID de agente activo establecido a: ${currentAgentState.id || 'Ninguno (default)'}.`);
+            if (!currentAgentState.id) {
                 console.log(`   -> Usando configuración de agente por defecto (ID es null).`);
-                agentConfig = { ...DEFAULT_AGENT_CONFIG };
+                 // <<< CHANGE: Use deep copy for default config >>>
+                currentAgentState.config = JSON.parse(JSON.stringify({
+                    ...DEFAULT_AGENT_CONFIG,
+                    knowledge: { ...DEFAULT_AGENT_CONFIG.knowledge, writingSampleTxt: '', files: [] } // Ensure files array
+                }));
             } else {
-                 console.log(`   -> Se espera que la configuración para el agente ${currentAgentId} se reciba por separado si es necesario.`);
+                // Config should be sent via IPC message 'SWITCH_AGENT', not relying on RELOAD
+                 console.log(`   -> Configuración para ${currentAgentState.id} debe ser enviada via mensaje IPC 'SWITCH_AGENT'.`);
+                 // If config wasn't sent, keep old one but ensure structure
+                 if (!currentAgentState.config || currentAgentState.config.id !== newAgentIdCmd) {
+                     console.warn("   -> No se recibió config para el nuevo agente en handleCommand. Usando default/anterior.");
+                     // Reset to default or keep previous, ensure structure
+                    currentAgentState.config = JSON.parse(JSON.stringify({
+                        ...DEFAULT_AGENT_CONFIG,
+                        id: newAgentIdCmd, // Set the new ID
+                        knowledge: { ...DEFAULT_AGENT_CONFIG.knowledge, writingSampleTxt: '', files: [] }
+                    }));
+                 } else {
+                     // Ensure knowledge structure of potentially old config
+                     if (!currentAgentState.config.knowledge) {
+                         currentAgentState.config.knowledge = { ...DEFAULT_AGENT_CONFIG.knowledge, writingSampleTxt: '', files: [] };
+                     } else {
+                         if (currentAgentState.config.knowledge.writingSampleTxt === undefined) currentAgentState.config.knowledge.writingSampleTxt = '';
+                         if (!currentAgentState.config.knowledge.files) currentAgentState.config.knowledge.files = [];
+                     }
+                 }
             }
+             // Clear history on switch command
+            clearConversationHistories();
             break;
         case 'RELOAD_RULES': // <<< ADDED
-            console.log(`[Worker ${userId}] Recibido comando RELOAD_RULES.`);
+            console.log(`[Worker ${userId}][handleCommand] Recibido comando RELOAD_RULES.`);
             if (payload && Array.isArray(payload.rules)) {
                 autoReplyRules = payload.rules;
                 console.log(`   -> Reglas actualizadas desde payload. Total: ${autoReplyRules.length}`);
@@ -1095,7 +1243,7 @@ function handleCommand(command, payload) {
             }
             break;
         case 'RELOAD_STARTERS': // <<< ADDED
-            console.log(`[Worker ${userId}] Recibido comando RELOAD_STARTERS.`);
+            console.log(`[Worker ${userId}][handleCommand] Recibido comando RELOAD_STARTERS.`);
             if (payload && Array.isArray(payload.starters)) {
                 geminiConversationStarters = payload.starters;
                 console.log(`   -> Starters actualizados desde payload. Total: ${geminiConversationStarters.length}`);
@@ -1104,21 +1252,29 @@ function handleCommand(command, payload) {
             }
             break;
         case 'RELOAD_AGENT_CONFIG': // <<< ADDED
-             console.log(`[Worker ${userId}] Recibido comando RELOAD_AGENT_CONFIG.`);
-            if (payload && payload.agentConfig && payload.agentConfig.id === currentAgentId) {
-                agentConfig = payload.agentConfig;
-                console.log(`   -> Configuración para agente activo (${currentAgentId}) actualizada desde payload.`);
-            } else if (payload && payload.agentConfig && payload.agentConfig.id !== currentAgentId) {
-                 console.warn(`   -> Recibido RELOAD_AGENT_CONFIG para agente ${payload.agentConfig.id}, pero el agente activo es ${currentAgentId}. Configuración no aplicada.`);
+             console.log(`[Worker ${userId}][handleCommand] Recibido comando RELOAD_AGENT_CONFIG.`);
+            if (payload && payload.agentConfig && payload.agentConfig.id === currentAgentState.id) {
+                // <<< MODIFIED: Ensure knowledge structure on reload >>>
+                const reloadedConfigCmd = JSON.parse(JSON.stringify(payload.agentConfig));
+                 if (!reloadedConfigCmd.knowledge) {
+                     reloadedConfigCmd.knowledge = { ...DEFAULT_AGENT_CONFIG.knowledge, writingSampleTxt: '', files: [] };
+                } else {
+                    if (reloadedConfigCmd.knowledge.writingSampleTxt === undefined) reloadedConfigCmd.knowledge.writingSampleTxt = '';
+                    if (!reloadedConfigCmd.knowledge.files) reloadedConfigCmd.knowledge.files = [];
+                }
+                currentAgentState.config = reloadedConfigCmd;
+                console.log(`   -> Configuración para agente activo (${currentAgentState.id}) actualizada desde payload.`);
+            } else if (payload && payload.agentConfig && payload.agentConfig.id !== currentAgentState.id) {
+                 console.warn(`   -> Recibido RELOAD_AGENT_CONFIG para agente ${payload.agentConfig.id}, pero el agente activo es ${currentAgentState.id}. Configuración no aplicada.`);
              } else if (!payload || !payload.agentConfig) {
                 console.warn(`   -> Comando RELOAD_AGENT_CONFIG recibido sin payload de config válido. No se puede actualizar.`);
             }
             break;
-         // TODO: Añadir case para 'RELOAD_CONFIG' (para otras configs)
-         // ...
         default:
-            console.warn(`[IPC Worker ${userId}] Tipo de mensaje no reconocido: ${command}`);
+            console.warn(`[Worker ${userId}][handleCommand] Tipo de comando no reconocido: ${command}`); // Log actualizado
     }
+
+    // Flag removed - no reset logic needed
 }
 
 // Añadir manejadores de excepciones no capturadas al final del archivo
@@ -1150,6 +1306,8 @@ async function isUserActiveInChat(userId, senderId) {
     const chatDocRef = firestoreDbWorker.collection('users').doc(userId).collection('chats').doc(senderId);
     try {
         // 1. Verificar flag explícito de actividad en el documento de chat
+        // This check remains, but its effectiveness depends on how `userIsActive` is set.
+        // It's primarily set when a human message is detected.
         const chatDoc = await chatDocRef.get();
         if (chatDoc.exists && chatDoc.data().userIsActive === true) {
             // Verificar si la actividad es reciente usando diferencia relativa
@@ -1159,15 +1317,16 @@ async function isUserActiveInChat(userId, senderId) {
                 const lastActivityMs = lastHumanTimestamp.getTime();
                 const diffMinutes = (nowMs - lastActivityMs) / (1000 * 60);
 
-                console.log(`[Worker ${userId}][PRESENCE v3] Último mensaje humano: ${lastHumanTimestamp.toISOString()}`);
+                console.log(`[Worker ${userId}][PRESENCE v3] Último mensaje humano (cacheado en chat doc): ${lastHumanTimestamp.toISOString()}`);
                 console.log(`[Worker ${userId}][PRESENCE v3] Tiempo transcurrido: ${diffMinutes.toFixed(2)} minutos`);
                 if (diffMinutes < 10) {
-                    console.log(`[Worker ${userId}][PRESENCE v3] ✅ Usuario ACTIVO (< 10 minutos)`);
+                    console.log(`[Worker ${userId}][PRESENCE v3] ✅ Usuario ACTIVO (< 10 minutos según cache)`);
                     return true;
                 }
-                console.log(`[Worker ${userId}][PRESENCE v3] ⚠️ Mensaje humano encontrado pero demasiado antiguo (${diffMinutes.toFixed(2)} min > 10 min)`);
+                console.log(`[Worker ${userId}][PRESENCE v3] ⚠️ Mensaje humano cacheado pero demasiado antiguo (${diffMinutes.toFixed(2)} min > 10 min)`);
             } else {
-                console.log(`[Worker ${userId}][PRESENCE v3] ⚠️ Flag userIsActive=true pero sin timestamp de actividad`);
+                console.log(`[Worker ${userId}][PRESENCE v3] ⚠️ Flag userIsActive=true pero sin timestamp de actividad cacheado.`);
+                // Fall through to check the messages collection directly
             }
         }
 
@@ -1176,6 +1335,7 @@ async function isUserActiveInChat(userId, senderId) {
         const humanMessagesRef = chatDocRef.collection('messages_human');
         const recentHumanMessages = await humanMessagesRef
             .where('timestamp', '>', tenMinutesAgo)
+            .orderBy('timestamp', 'desc') // Get the most recent first
             .limit(1)
             .get();
 
@@ -1191,11 +1351,11 @@ async function isUserActiveInChat(userId, senderId) {
                 console.log(`[Worker ${userId}][PRESENCE v3] Mensaje encontrado en messages_human: ${msgTimestamp.toISOString()}`);
                 console.log(`[Worker ${userId}][PRESENCE v3] Tiempo transcurrido: ${diffMinutes.toFixed(2)} minutos`);
                 if (diffMinutes < 10) {
-                    console.log(`[Worker ${userId}][PRESENCE v3] ✅ Usuario ACTIVO (mensaje < 10 minutos)`);
-                    // Actualizar estado de actividad
+                    console.log(`[Worker ${userId}][PRESENCE v3] ✅ Usuario ACTIVO (mensaje humano < 10 minutos)`);
+                    // Actualizar estado de actividad en el chat doc
                     await chatDocRef.set({
                         userIsActive: true,
-                        lastHumanMessageTimestamp: lastMsg.timestamp,
+                        lastHumanMessageTimestamp: lastMsg.timestamp, // Use the timestamp from the found message
                         lastActivityCheck: admin.firestore.FieldValue.serverTimestamp()
                     }, { merge: true });
                     return true;
@@ -1206,37 +1366,9 @@ async function isUserActiveInChat(userId, senderId) {
             console.log(`[Worker ${userId}][PRESENCE v3] No se encontraron mensajes humanos recientes en messages_human`);
         }
 
-        // 3. Verificar mensajes recientes del contacto/tercero como último criterio
-        console.log(`[Worker ${userId}][PRESENCE v3] Verificando mensajes recientes del contacto...`);
-        const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000); // Ventana más corta para mensajes del contacto
-        const contactMessagesRef = chatDocRef.collection('messages_contact');
-        const recentContactMessages = await contactMessagesRef
-            .where('timestamp', '>', fiveMinutesAgo)
-            .limit(1)
-            .get();
-
-        if (!recentContactMessages.empty) {
-            const lastMsg = recentContactMessages.docs[0].data();
-            const msgTimestamp = lastMsg.timestamp?.toDate();
-
-            if (msgTimestamp) {
-                const nowMs = Date.now();
-                const msgMs = msgTimestamp.getTime();
-                const diffMinutes = (nowMs - msgMs) / (1000 * 60);
-
-                console.log(`[Worker ${userId}][PRESENCE v3] Mensaje reciente del contacto: ${msgTimestamp.toISOString()}`);
-                console.log(`[Worker ${userId}][PRESENCE v3] Tiempo transcurrido: ${diffMinutes.toFixed(2)} minutos`);
-                if (diffMinutes < 5) {
-                    console.log(`[Worker ${userId}][PRESENCE v3] ✅ Usuario considerado ACTIVO porque el contacto envió mensaje hace menos de 5 minutos`);
-                    // No actualizar userIsActive basado en actividad del contacto, solo considerarlo activo para esta evaluación
-                    return true;
-                }
-            }
-        }
-
-        // No se encontró actividad humana reciente
-        console.log(`[Worker ${userId}][PRESENCE v3] ⚠️ Usuario INACTIVO (sin actividad reciente)`);
-        // Actualizar estado de inactividad
+        // Si llegamos aquí, no se encontró actividad humana reciente
+        console.log(`[Worker ${userId}][PRESENCE v3] ⚠️ Usuario INACTIVO (sin actividad humana reciente)`);
+        // Actualizar estado de inactividad en el chat doc
         await chatDocRef.set({
             userIsActive: false,
             lastActivityCheck: admin.firestore.FieldValue.serverTimestamp()
@@ -1491,110 +1623,90 @@ async function migrateOldMessages(chatId) {
 }
 
 client.on('message_create', async (message) => {
-    // Log inicial para saber que se detectó la creación
-    console.log(`
-[Worker ${userId}][MESSAGE_CREATE v2] ====== MENSAJE SALIENTE DETECTADO ======`);
-    console.log(`[Worker ${userId}][MESSAGE_CREATE v2] ID: ${message.id?.id || 'unknown'}`);
-    console.log(`[Worker ${userId}][MESSAGE_CREATE v2] To: ${message.to || 'unknown'}`);
-    console.log(`[Worker ${userId}][MESSAGE_CREATE v2] Body: "${message.body?.substring(0, 50)}${message.body?.length > 50 ? '...' : ''}"`);
+    // Log inicial detección
+    console.log(`\n[Worker ${userId}][MESSAGE_CREATE v3] ====== MENSAJE CREATE DETECTADO ======`);
+    console.log(`[Worker ${userId}][MESSAGE_CREATE v3] ID: ${message.id?.id || 'unknown'}, To: ${message.to || 'unknown'}, FromMe: ${message.fromMe}`);
+    console.log(`[Worker ${userId}][MESSAGE_CREATE v3] Body: "${message.body?.substring(0, 50)}${message.body?.length > 50 ? '...' : ''}"`);
 
-
-    // ELIMINAMOS ESTE CHECK - SABEMOS QUE message_create SIEMPRE ES PARA MENSAJES SALIENTES
-    // INDEPENDIENTEMENTE DEL VALOR DE message.fromMe
-    // if (!message.fromMe) {
-    //     console.log(`[Worker ${userId}][MESSAGE_CREATE v2] ⚠️ Mensaje message_create con fromMe=false. Ignorando.`);
-    //     return;
-    // }
-
+    // <<< CRUCIAL CHECK: Salir inmediatamente si message.fromMe es false >>>
+    if (message.fromMe === false) {
+         console.warn(`[Worker ${userId}][MESSAGE_CREATE v3] ⚠️ Evento message_create detectado para mensaje entrante (fromMe=false). Ignorando. ID: ${message.id?.id}`);
+         // Flag removed - no reset needed
+         return; // Dejar que el evento 'message' lo maneje.
+    }
+    // Si fromMe es true o ambiguo (undefined/null), proceder con cautela.
 
     try {
         const chatPartnerId = message.to;
-
-        // Asegurar que existen las colecciones necesarias para este chat
-        await ensureChatCollections(chatPartnerId);
-
-        const chatDocRef = firestoreDbWorker.collection('users').doc(userId).collection('chats').doc(chatPartnerId);
-        // 1. Verificar si es un mensaje del bot (buscar en messages_bot)
-        console.log(`[Worker ${userId}][MESSAGE_CREATE v2] Verificando si es un mensaje automático...`);
-        const recentBotTime = new Date(Date.now() - 2000); // 2 segundos atrás
-        const recentBotMessages = await chatDocRef.collection('messages_bot')
-            .where('timestamp', '>', recentBotTime)
-            .where('body', '==', message.body)
-            .limit(1)
-            .get();
-
-        // Si encontramos coincidencia, es un mensaje del bot que ya guardamos, salir
-        if (!recentBotMessages.empty) {
-            console.log(`[Worker ${userId}][MESSAGE_CREATE v2] ✅ Mensaje identificado como del bot, ya guardado en messages_bot.`);
+        // Añadir chequeo extra para ignorar mensajes sin chatPartnerId o a status broadcast
+        if (!chatPartnerId || chatPartnerId.includes('status@broadcast')) {
+            console.log(`[Worker ${userId}][MESSAGE_CREATE v3] Ignorando mensaje sin destinatario válido o a status broadcast.`);
             return;
         }
 
-        // 2. Si llegamos aquí, es un mensaje genuino del usuario
-        console.log(`[Worker ${userId}][MESSAGE_CREATE v2] ✅ Mensaje GENUINO del usuario detectado.`);
-        // Timestamp para todo
+        await ensureChatCollections(chatPartnerId);
+        const chatDocRef = firestoreDbWorker.collection('users').doc(userId).collection('chats').doc(chatPartnerId);
+
+        // 1. Verificar si es un mensaje del bot que ACABAMOS de enviar
+        console.log(`[Worker ${userId}][MESSAGE_CREATE v3] Verificando si es un mensaje automático RECIENTE...`);
+        const recentBotTime = new Date(Date.now() - 5000); // Ventana de 5 segundos
+        let isRecentBotMessage = false; // Flag to track if match found
+
+        // Get recent bot messages by timestamp ONLY
+        const recentBotMessagesSnapshot = await chatDocRef.collection('messages_bot')
+            .where('timestamp', '>', recentBotTime)
+            // Check in code if any of the recent messages match the body
+            .get();
+
+        if (!recentBotMessagesSnapshot.empty) {
+            for (const doc of recentBotMessagesSnapshot.docs) {
+                if (doc.data().body === message.body) {
+                    isRecentBotMessage = true;
+                    break; // Found a match, no need to check further
+                }
+            }
+        }
+
+        if (isRecentBotMessage) {
+            console.log(`[Worker ${userId}][MESSAGE_CREATE v3] ✅ Mensaje saliente coincide con mensaje reciente del bot. Ignorando guardado duplicado.`);
+            return; // Es un mensaje del bot, ya gestionado por sendBotMessage
+        }
+
+        // 2. Si NO es un mensaje reciente del bot Y message.fromMe NO era false,
+        //    tratarlo como un mensaje genuino del usuario.
+        console.log(`[Worker ${userId}][MESSAGE_CREATE v3] ✅ Mensaje saliente considerado GENUINO del usuario (no es bot reciente y fromMe no era false).`);
         const serverTimestamp = admin.firestore.FieldValue.serverTimestamp();
-        // 3. Guardar en messages_human
-        await chatDocRef.collection('messages_human').add({
+
+        // Guardar en messages_human y messages_all
+        const humanMessageData = {
             from: `me (${userId})`,
             to: chatPartnerId,
             body: message.body || '',
             timestamp: serverTimestamp,
-            isFromMe: true,
+            isFromMe: true, // Asumimos true basado en el contexto del evento ahora
             isAutoReply: false,
             origin: 'human',
             messageId: message.id?.id || 'unknown'
-        });
+        };
+        // Ejecutar escrituras en paralelo
+        await Promise.all([
+            chatDocRef.collection('messages_human').add(humanMessageData),
+            chatDocRef.collection('messages_all').add(humanMessageData)
+        ]);
 
-        // 4. Guardar en messages_all para vista unificada
-        await chatDocRef.collection('messages_all').add({
-            from: `me (${userId})`,
-            to: chatPartnerId,
-            body: message.body || '',
-            timestamp: serverTimestamp,
-            isFromMe: true,
-            isAutoReply: false,
-            origin: 'human',
-            messageId: message.id?.id || 'unknown'
-        });
-
-        // 5. Actualizar estado de actividad del usuario
+        // Actualizar metadata del chat para actividad del usuario
         await chatDocRef.set({
             userIsActive: true,
             lastHumanMessageTimestamp: serverTimestamp,
-            lastMessageTimestamp: serverTimestamp,
+            lastMessageTimestamp: serverTimestamp, // Actualizar último mensaje general también
             lastMessageContent: message.body || '',
             userActivitySource: 'message_create_event'
         }, { merge: true });
 
-        console.log(`[Worker ${userId}][MESSAGE_CREATE v2] Mensaje genuino guardado y usuario marcado como activo.`);
+        console.log(`[Worker ${userId}][MESSAGE_CREATE v3] Mensaje genuino guardado y usuario marcado como activo.`);
 
-        // <<< ADDED: Notify server about the new incoming message for potential WebSocket broadcast >>>
-        if (process.send) {
-            const messagePayload = {
-                chatId: chatPartnerId,
-                messageId: message.id?.id || 'unknown',
-                body: message.body || '',
-                timestamp: new Date().toISOString(), // Use current time as Firestore timestamp isn't available yet
-                from: chatPartnerId, // The sender is the contact
-                isFromMe: false,
-                origin: 'contact'
-                // Add other relevant fields if needed by the frontend
-            };
-            process.send({ type: 'NEW_MESSAGE_RECEIVED', payload: messagePayload });
-            console.log(`[Worker ${userId}][IPC] Sent NEW_MESSAGE_RECEIVED notification to server for chat ${chatPartnerId}`);
-        } else {
-            console.warn(`[Worker ${userId}][IPC] process.send not available. Cannot notify server about new message.`);
-        }
-        // <<< END: Notify server >>>
-
-        // Actualizar documento del chat
-        await chatDocRef.set({
-            lastContactMessageTimestamp: serverTimestamp,
-            lastMessageTimestamp: serverTimestamp,
-            lastMessageContent: message.body
-        }, { merge: true });
     } catch (error) {
-        console.error(`[Worker ${userId}][MESSAGE_CREATE v2] Error procesando mensaje saliente:`, error);
+        console.error(`[Worker ${userId}][MESSAGE_CREATE v3] Error procesando mensaje saliente:`, error);
         sendErrorInfo(`Error en message_create: ${error.message}`);
     }
 });
@@ -1622,11 +1734,12 @@ async function getConversationHistory(chatId, maxMessages = 6) {
             // Solo incluir mensajes con body (texto)
             if (msgData.body) {
                 messages.push({
-                    role: msgData.origin === 'bot' ? 'assistant' : 'user',
+                    // Ensure role is 'assistant' or 'user'
+                    role: (msgData.origin === 'bot' || msgData.isFromMe === true && msgData.isAutoReply === true) ? 'assistant' : 'user',
                     content: msgData.body,
                     timestamp: msgData.timestamp?.toDate?.() || new Date(),
-                    // Estimación aproximada de tokens (1 token ≈ 4 caracteres en promedio)
-                    estimatedTokens: Math.ceil(msgData.body.length / 4)
+                    // <<< USAR CONSTANTE GLOBAL >>>
+                    estimatedTokens: Math.ceil((msgData.body.length || 0) / TOKEN_ESTIMATE_RATIO)
                 });
             }
         });
@@ -1634,19 +1747,19 @@ async function getConversationHistory(chatId, maxMessages = 6) {
         // Ordenar cronológicamente
         messages.sort((a, b) => a.timestamp - b.timestamp);
 
-        // Control de tokens: limitar a ~2000 tokens para el historial
-        const MAX_HISTORY_TOKENS = 2000;
+        // Control de tokens: limitar a ~2000 tokens para el historial del prompt
+        const MAX_HISTORY_TOKENS_FOR_PROMPT = 2000; // Renamed constant
         let totalTokens = 0;
         let selectedMessages = [];
 
         // Primero incluir los mensajes más recientes (desde el final)
         for (let i = messages.length - 1; i >= 0; i--) {
             const msg = messages[i];
-            if (totalTokens + msg.estimatedTokens <= MAX_HISTORY_TOKENS &&
+            if (totalTokens + msg.estimatedTokens <= MAX_HISTORY_TOKENS_FOR_PROMPT &&
                 selectedMessages.length < maxMessages) {
                 selectedMessages.unshift(msg); // Añadir al principio para mantener orden cronológico
                 totalTokens += msg.estimatedTokens;
-            } else if (totalTokens >= MAX_HISTORY_TOKENS || selectedMessages.length >= maxMessages) {
+            } else if (totalTokens >= MAX_HISTORY_TOKENS_FOR_PROMPT || selectedMessages.length >= maxMessages) {
                 // Ya tenemos suficientes mensajes o tokens
                 break;
             }
@@ -1660,46 +1773,151 @@ async function getConversationHistory(chatId, maxMessages = 6) {
     }
 }
 
-// Función para construir un prompt con historial de conversación
-async function buildPromptWithHistory(chatId, currentMessage, persona) {
-    try {
-        // Obtener historial de mensajes
-        const history = await getConversationHistory(chatId);
+// <<< NUEVA FUNCIÓN para descargar contenido de URL >>>
+// Moved this function definition BEFORE buildPromptWithHistory
+async function downloadFileContent(url, userId) { // Added userId for logging
+    return new Promise((resolve, reject) => {
+        console.log(`[Worker ${userId}][File Download] Intentando descargar contenido desde: ${url}`);
+        https.get(url, (res) => {
+            let data = '';
+            // Handle potential redirects (optional but good practice)
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                console.log(`[Worker ${userId}][File Download] Redirección detectada a: ${res.headers.location}`);
+                // Recursively call downloadFileContent for the new URL
+                downloadFileContent(res.headers.location, userId).then(resolve).catch(reject);
+                return;
+            }
 
-        // Construir la sección de historial del prompt
-        let historyText = '';
-        if (history.length > 0) {
-            historyText = history.map(msg => {
-                const speaker = msg.role === 'assistant' ? 'Asistente' : 'Usuario';
-                return `${speaker}: ${msg.content}`;
-            }).join('\n\n'); // Use escaped newlines
-        }
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+                console.error(`[Worker ${userId}][File Download] Fallo al descargar. Código de estado: ${res.statusCode}`);
+                return reject(new Error(`Fallo al descargar. Código de estado: ${res.statusCode}`));
+            }
 
-        // Detectar si el historial es muy largo y generar resumen si es necesario
-        if (historyText.length > 6000) {
-            console.log(`[Worker ${userId}][CONTEXT] Historial muy extenso (${historyText.length} caracteres). Considerando resumen.`);
-            // Si se implementa un resumen, se podría usar Gemini para generarlo
-            // Por ahora, simplemente truncamos y añadimos una nota
-            historyText = `[Conversación previa resumida]\n\n${history.slice(-3).map(msg => {
-                const speaker = msg.role === 'assistant' ? 'Asistente' : 'Usuario';
-                return `${speaker}: ${msg.content}`;
-            }).join('\n\n')}`; // Use escaped newlines
-        }
+            res.on('data', (chunk) => {
+                data += chunk;
+            });
 
-        // Construir prompt base con la persona del agente - ensure template literal uses standard newlines
-        const basePrompt = `Eres ${persona?.name || 'un asistente virtual'}.\nRol: ${persona?.role || 'Ayudar a los usuarios.'}\nTono: ${persona?.tone || 'amable'}.\nEstilo: ${persona?.style || 'claro'}.\nIdioma: ${persona?.language || 'es'}.\n\nInstrucciones Principales:\n${persona?.instructions || 'No se proporcionaron instrucciones específicas.'} // <-- AÑADIDO\n\nDirectrices Adicionales:\n${(persona?.guidelines || []).map(g => `- ${g}`).join('\n') || '- Responde de forma concisa.'}\n\nIMPORTANTE: Mantén la continuidad de la conversación. Recuerda lo que se ha dicho previamente y responde de manera coherente con el historial.`;
+            res.on('end', () => {
+                console.log(`[Worker ${userId}][File Download] Contenido descargado exitosamente desde: ${url} (Tamaño: ${data.length} bytes)`);
+                resolve(data);
+            });
+        }).on('error', (err) => {
+            console.error(`[Worker ${userId}][File Download] Error durante la descarga: ${err.message}`);
+            reject(err);
+        });
+    });
+}
+// <<< FIN NUEVA FUNCIÓN >>>
 
+// --- v4 --- (Con historial, conocimiento y muestra de escritura)
+async function buildPromptWithHistory(chatId, currentMessage) {
+    // --- CORRECTED: Access global variables directly ---
+    // const userId = getUserIdFromGlobalState(); // Placeholder REMOVED
+    // const activeAgentConfig = getAgentConfigFromGlobalState(); // Placeholder REMOVED
+    // Use the global userId defined at the top of the script
+    const currentUserId = userId; // Assign to a local const for clarity if needed, or use global userId directly
+    const activeAgentConfig = currentAgentState.config; // Use the global state object
+    // --- END CORRECTION ---
 
-        // Prompt completo con historial y mensaje actual - ensure template literal uses standard newlines
-        const fullPrompt = `${basePrompt}\n\n---\n${history.length > 0 ? 'Historial de la Conversación:' : 'No hay historial previo de esta conversación.'}\n${historyText}\n\n---\nMensaje Actual del Usuario:\nUsuario: ${currentMessage}\n\n---\nTu Respuesta (siguiendo el contexto de la conversación):`;
-
-        console.log(`[Worker ${userId}][CONTEXT] Prompt con historial generado. Longitud aproximada: ${fullPrompt.length} caracteres.`);
-        return fullPrompt;
-    } catch (error) {
-        console.error(`[Worker ${userId}][CONTEXT] Error construyendo prompt con historial:`, error);
-        // En caso de error, devolver un prompt básico
-        return `Eres un asistente. Responde al mensaje: ${currentMessage}`;
+    if (!activeAgentConfig) {
+        // Use the correct userId variable in the log message
+        console.error(`[Worker ${currentUserId}][buildPromptWithHistory v4] Error: No se encontró configuración de agente activa.`);
+        return null; // Or handle error appropriately
     }
+
+    const persona = activeAgentConfig.persona || {};
+    const knowledge = activeAgentConfig.knowledge || {};
+    const knowledgeFiles = knowledge.files || [];
+    const knowledgeUrls = knowledge.urls || []; // <-- Get the URLs array
+    const writingSample = knowledge.writingSampleTxt || '';
+    let personaInstructions = persona.instructions || 'Eres un asistente conversacional.';
+
+    // <<< MODIFICACIÓN: Añadir instrucción sobre URL si existe >>>
+    if (knowledgeUrls.length > 0) {
+        const firstUrl = knowledgeUrls[0]; // Use the first URL for now
+        const urlInstruction = `IMPORTANT GOAL: Your primary objective is to subtly guide the conversation towards encouraging the user to visit this link: ${firstUrl}. Mention it naturally when relevant.`;
+        // Prepend the URL instruction to the main persona instructions
+        personaInstructions = `${urlInstruction}\n\n${personaInstructions}`;
+        // Use the correct userId variable in the log message
+        console.log(`[Worker ${currentUserId}][buildPromptWithHistory v4] Instrucción de URL añadida al prompt.`);
+    }
+    // <<< FIN MODIFICACIÓN >>>
+
+    let fileContent = '';
+    if (knowledgeFiles.length > 0) {
+        const firstFile = knowledgeFiles[0];
+        try {
+            // Use the previously defined downloadFileContent function
+            // Pass the correct userId variable
+            fileContent = await downloadFileContent(firstFile.url, currentUserId);
+            // Use the correct userId variable in the log message
+            console.log(`[Worker ${currentUserId}][buildPromptWithHistory v4] Contenido del archivo "${firstFile.name}" cargado.`);
+        } catch (error) {
+            // Log the error, but continue without the file content
+            // Use the correct userId variable in the log message
+            console.error(`[Worker ${currentUserId}][buildPromptWithHistory v4] No se pudo descargar el archivo ${firstFile.name} (${firstFile.url}): ${error}`);
+            // Optionally, you could add a placeholder or specific error message to the prompt
+            // fileContent = "[Error: Could not load knowledge file]";
+        }
+    }
+
+    // 2. Combinar writingSample y fileContent para el prompt
+    const MAX_KNOWLEDGE_CHARS = 4000; // Limitar caracteres combinados
+    let knowledgeContext = ''; // Initialize knowledgeContext here
+    let combinedKnowledge = '';
+    let knowledgeSourceInfo = [];
+
+    if (writingSample.length > 0) {
+         // Use the correct userId variable in the log message
+         console.log(`[Worker ${currentUserId}][buildPromptWithHistory v4] Añadiendo writingSampleTxt (${writingSample.length} chars) al contexto.`);
+         combinedKnowledge += `\n\n--- INICIO Muestra de Escritura (writingSampleTxt) ---\n${writingSample}\n--- FIN Muestra de Escritura ---`;
+         knowledgeSourceInfo.push('writingSampleTxt');
+    }
+    if (fileContent.length > 0) {
+         // Use the correct userId variable in the log message
+         console.log(`[Worker ${currentUserId}][buildPromptWithHistory v4] Añadiendo contenido de archivo (${knowledgeFiles[0].name}, ${fileContent.length} chars) al contexto.`);
+         combinedKnowledge += `\n\n--- INICIO Contenido de Archivo (${knowledgeFiles[0].name}) ---\n${fileContent}\n--- FIN Contenido de Archivo ---`;
+         knowledgeSourceInfo.push(`Archivo: ${knowledgeFiles[0].name}`);
+    }
+
+    if (combinedKnowledge.length > 0) {
+        // Truncar si es necesario
+        let truncatedKnowledge = combinedKnowledge;
+        if (combinedKnowledge.length > MAX_KNOWLEDGE_CHARS) {
+            truncatedKnowledge = combinedKnowledge.substring(combinedKnowledge.length - MAX_KNOWLEDGE_CHARS);
+            console.log(`   -> Conocimiento combinado truncado a ${MAX_KNOWLEDGE_CHARS} caracteres.`);
+        }
+        const safeKnowledge = truncatedKnowledge.replace(/`/g, '\\`'); // Escapar backticks
+
+        knowledgeContext = `
+
+---
+**Base de Conocimiento (Analizar y Usar para Estilo/Información):**
+(Fuentes: ${knowledgeSourceInfo.join(', ')})
+${safeKnowledge}
+---
+**Instrucción Adicional sobre Conocimiento:** Analiza el texto anterior ("Base de Conocimiento") y adapta tu respuesta para que coincida con el tono, vocabulario y estilo general encontrado, además de usar la información relevante que contenga. Sigue siempre tu identidad como ${persona.name || 'Agente IA'}.
+`;
+        // Use the correct userId variable in the log message
+         console.log(`[Worker ${currentUserId}][buildPromptWithHistory v4] Sección de conocimiento añadida al prompt.`);
+    }
+
+    // 3. Obtener historial de conversación
+    // Use the correct userId variable when calling
+    const history = await getConversationHistory(chatId);
+    const historyText = history.map(msg => `${msg.role === 'assistant' ? (persona.name || 'Agente IA') : 'Cliente'}: ${msg.content}`).join('\n');
+
+    // Prompt completo con historial, conocimiento y mensaje actual
+    const safeCurrentMessage = (currentMessage || '').replace(/`/g, '\\`');
+    const fullPrompt = `${personaInstructions}\n\n${knowledgeContext}\n\n---
+**Contexto de la Conversación:**\n${historyText}
+---
+\n**Mensaje Actual del Cliente:**\nCliente: ${safeCurrentMessage}\n\n---    
+**Tu Respuesta (Como ${persona.name || 'Agente IA'}):**`;
+
+    // Use the correct userId variable in the log message
+    console.log(`[Worker ${currentUserId}][CONTEXT] Prompt final generado. Longitud aprox: ${fullPrompt.length} caracteres.`);
+    return fullPrompt;
 }
 
 // <<< ADDED: Sistema de tracking de tokens para conversaciones Gemini >>>
@@ -1707,9 +1925,9 @@ async function buildPromptWithHistory(chatId, currentMessage, persona) {
 const conversationTokenMap = new Map();
 
 // Constantes para gestión de tokens
-const MAX_CONVERSATION_TOKENS = 15000; // Máximo para toda la conversación (ajustar según modelo)
-const MAX_HISTORY_TOKENS = 2000; // Máximo para el historial en cada prompt
-const TOKEN_ESTIMATE_RATIO = 4; // Caracteres por token (estimación)
+const MAX_CONVERSATION_TOKENS = 15000; // Máximo tokens a mantener por conversación
+const MAX_HISTORY_TOKENS_FOR_PROMPT = 2000; // Máximo tokens de historial a usar en el prompt
+const TOKEN_ESTIMATE_RATIO = 4; // Estimación: 1 token por cada 4 caracteres
 
 // Función para registrar un mensaje en el tracking de tokens
 function trackMessageTokens(chatId, role, content) {
@@ -1741,8 +1959,13 @@ function trackMessageTokens(chatId, role, content) {
 
     // Si excedemos el límite, eliminar mensajes antiguos
     while (conversation.totalTokens > MAX_CONVERSATION_TOKENS && conversation.messages.length > 1) {
-        const oldestMessage = conversation.messages.shift();
-        conversation.totalTokens -= oldestMessage.estimatedTokens;
+        const oldestMessage = conversation.messages.shift(); // Remove from the beginning (oldest)
+        if (oldestMessage) { // Check if shift returned a value
+             conversation.totalTokens -= oldestMessage.estimatedTokens;
+        } else {
+             // Should not happen if length > 1, but break just in case
+             break;
+        }
     }
 
     // Log de depuración
@@ -1765,10 +1988,111 @@ function cleanupOldConversations(maxAgeMs = 24 * 60 * 60 * 1000) { // 24 horas p
     }
 
     if (cleanedCount > 0) {
-        console.log(`[Worker ${userId}][TOKEN TRACKING] Limpiadas ${cleanedCount} conversaciones antiguas`);
+        console.log(`[Worker ${userId}][TOKEN TRACKING] Limpiadas ${cleanedCount} conversaciones antiguas del tracking de tokens.`);
     }
 }
 
 // Configurar limpieza periódica cada 6 horas
-setInterval(cleanupOldConversations, 6 * 60 * 60 * 1000);
+// setInterval(cleanupOldConversations, 6 * 60 * 60 * 1000); // Already exists
+
 // <<< END: Sistema de tracking de tokens >>>
+
+// <<< NUEVA FUNCIÓN >>>
+async function clearConversationHistories() {
+    if (!firestoreDbWorker || !userId) {
+        console.error(`[Worker ${userId}][History Clear] Firestore DB o User ID no disponibles. No se puede limpiar historial.`);
+        return;
+    }
+    console.log(`[Worker ${userId}][History Clear] === INICIANDO LIMPIEZA DE HISTORIAL DE CHATS ===`);
+    try {
+        const chatsRef = firestoreDbWorker.collection('users').doc(userId).collection('chats');
+        const chatsSnapshot = await chatsRef.get();
+
+        if (chatsSnapshot.empty) {
+            console.log(`[Worker ${userId}][History Clear] No se encontraron chats para limpiar.`);
+            return;
+        }
+
+        let chatsProcessed = 0;
+        const promises = [];
+
+        chatsSnapshot.forEach(chatDoc => {
+            chatsProcessed++;
+            const chatId = chatDoc.id;
+            console.log(`[Worker ${userId}][History Clear] Limpiando historial para chat: ${chatId}`);
+            // Borrar colecciones de mensajes (messages_all, messages_human, messages_bot, messages_contact)
+            // También borrar la colección de migración si existe
+            const collectionsToDelete = ['messages_all', 'messages_human', 'messages_bot', 'messages_contact', '_migrations'];
+            collectionsToDelete.forEach(colName => {
+                 // Need the helper function defined below
+                promises.push(deleteCollection(chatDoc.ref.collection(colName)));
+            });
+            // Opcional: Resetear campos en el documento de chat principal
+            promises.push(chatDoc.ref.update({
+                lastMessageTimestamp: null,
+                lastMessageContent: null,
+                lastHumanMessageTimestamp: null,
+                lastBotMessageTimestamp: null,
+                lastContactMessageTimestamp: null,
+                userIsActive: false, // Reset activity status as well
+                historyClearedAt: admin.firestore.FieldValue.serverTimestamp()
+            }).catch(err => { // Catch potential errors during update
+                 console.error(`[Worker ${userId}][History Clear] Error updating chat doc ${chatId}:`, err);
+                 // Don't stop the whole process, just log the error
+            }));
+        });
+
+        await Promise.all(promises);
+        console.log(`[Worker ${userId}][History Clear] === HISTORIAL LIMPIADO para ${chatsProcessed} chats ===`);
+
+    } catch (error) {
+        console.error(`[Worker ${userId}][History Clear] Error limpiando historiales de chat:`, error);
+        sendErrorInfo(`Error limpiando historial: ${error.message}`);
+    }
+}
+
+// Helper function to delete a collection (Firestore doesn't have a direct method)
+async function deleteCollection(collectionRef, batchSize = 50) {
+    // Ensure firestoreDbWorker is available in this scope
+    if (!firestoreDbWorker) {
+        console.error("[deleteCollection] firestoreDbWorker is not available.");
+        return; // Or throw an error
+    }
+    const query = collectionRef.limit(batchSize);
+
+    return new Promise((resolve, reject) => {
+        deleteQueryBatch(query, batchSize, resolve, reject);
+    });
+}
+
+async function deleteQueryBatch(query, batchSize, resolve, reject) {
+     // Ensure firestoreDbWorker is available in this scope
+     if (!firestoreDbWorker) {
+         console.error("[deleteQueryBatch] firestoreDbWorker is not available.");
+         return reject(new Error("firestoreDbWorker not available"));
+     }
+    try {
+        const snapshot = await query.get();
+
+        // When there are no documents left, we are done
+        if (snapshot.size === 0) {
+            return resolve();
+        }
+
+        // Delete documents in a batch
+        const batch = firestoreDbWorker.batch();
+        snapshot.docs.forEach((doc) => {
+            batch.delete(doc.ref);
+        });
+        await batch.commit();
+
+        // Recurse on the next process tick, to avoid hitting stack limits
+        process.nextTick(() => {
+            deleteQueryBatch(query, batchSize, resolve, reject);
+        });
+    } catch (error) {
+        console.error("Error deleting collection batch:", error);
+        reject(error);
+    }
+}
+// <<< FIN NUEVAS FUNCIONES >>>
