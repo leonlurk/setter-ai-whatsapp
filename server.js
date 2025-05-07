@@ -7,6 +7,7 @@ const admin = require('firebase-admin'); // <<< Importar Firebase Admin
 const { fork } = require('child_process');
 const { v4: uuidv4 } = require('uuid');
 const WebSocket = require('ws'); // <<< ADDED: Import WebSocket library
+const { GoogleGenerativeAI } = require('@google/generative-ai'); // Ensure this is imported
 
 // === CONFIGURACIÓN INICIAL ===
 const app = express();
@@ -1742,3 +1743,320 @@ process.on('SIGINT', () => {
         });
     }, 500); // Give 0.5s for WebSockets to close
 });
+
+// <<< ADDED: Gemini AI Initialization for server.js >>>
+let serverGeminiModel;
+try {
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    if (!geminiApiKey) {
+      console.warn("[Server][Gemini] GEMINI_API_KEY environment variable is not defined. Prompt helper will not work.");
+    } else {
+      const genAI = new GoogleGenerativeAI(geminiApiKey);
+      serverGeminiModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); // Or your preferred model
+      console.log("[Server][Gemini] Gemini Model initialized successfully for server utilities.");
+    }
+} catch(geminiInitError) {
+    console.error("[Server][Gemini] ERROR Initializing GoogleGenerativeAI for server utilities:", geminiInitError);
+}
+// <<< END ADDED: Gemini AI Initialization >>>
+
+// === NEW ENDPOINT FOR ASSISTED PROMPT GENERATION ===
+app.post('/users/:userId/generate-assisted-prompt', authenticateApiKey, async (req, res) => {
+    const userId = req.params.userId;
+    // Destructure all new and existing fields from req.body
+    const {
+        objective, needsTools, tools, expectedInputs, expectedOutputs,
+        agentNameOrRole, companyOrContext, targetAudience, desiredTone,
+        keyInfoToInclude, thingsToAvoid, primaryCallToAction,
+        // Añadir campo para respuestas de seguimiento
+        followupResponses = [] // Valor predeterminado como array vacío
+    } = req.body;
+
+    console.log(`[Server] POST /users/${userId}/generate-assisted-prompt - Received data:`, req.body);
+
+    if (!serverGeminiModel) {
+        return res.status(503).json({ success: false, message: "Servicio de IA no disponible en este momento." });
+    }
+
+    if (!objective) {
+        return res.status(400).json({ success: false, message: "El objetivo del prompt es requerido." });
+    }
+
+    // Generar sección de información de seguimiento si existe
+    let followupSection = '';
+    if (followupResponses && followupResponses.length > 0) {
+        followupSection = `\n\n12. **Información Adicional y Detalles de Seguimiento:**\n`;
+        
+        followupResponses.forEach((item, index) => {
+            if (item.question && (item.answer || item.selectedOptions)) {
+                const responseValue = item.answer || 
+                    (Array.isArray(item.selectedOptions) ? item.selectedOptions.join(', ') : item.selectedOptions);
+                
+                if (responseValue && responseValue.trim()) {
+                    followupSection += `    ${String.fromCharCode(97 + index)}. **${item.question}**\n`;
+                    followupSection += `       ${responseValue}\n\n`;
+                }
+            }
+        });
+    }
+
+    // Construct the enhanced meta-prompt
+    let metaPrompt = `Eres un experto en la creación de prompts detallados y efectivos para agentes de inteligencia artificial.
+Tu tarea es generar un prompt de "instrucciones para la persona" para un nuevo agente IA, basándote en la siguiente información detallada proporcionada por el usuario:
+
+1.  **Objetivo Principal del Agente:**
+    ${objective}
+
+2.  **Nombre o Rol del Agente:**
+    ${agentNameOrRole || 'No especificado'}
+
+3.  **Nombre de la Empresa o Contexto Principal:**
+    ${companyOrContext || 'No especificado'}
+
+4.  **Audiencia o Cliente Ideal:**
+    ${targetAudience || 'No especificada'}
+
+5.  **Tono de Comunicación Deseado:**
+    ${desiredTone || 'Servicial y profesional por defecto'}
+
+6.  **¿Necesita acceso a herramientas/funciones específicas?** ${needsTools ? 'Sí' : 'No'}
+    ${needsTools && tools ? `    Herramientas Específicas: ${tools}` : ''}
+
+7.  **Ejemplos de Entradas de Clientes (lo que el cliente podría decir/preguntar):**
+    ${expectedInputs || 'No especificadas'}
+
+8.  **Ejemplos de Salidas/Acciones del Agente (lo que el agente debe hacer/responder):**
+    ${expectedOutputs || 'No especificadas'}
+
+9.  **Información Clave que el Agente DEBE Incluir o Conocer:**
+    ${keyInfoToInclude || 'Ninguna específica'}
+
+10. **Cosas que el Agente DEBE EVITAR:**
+    ${thingsToAvoid || 'Ninguna específica'}
+
+11. **Principal Llamada a la Acción que el agente debe impulsar:**
+    ${primaryCallToAction || 'Asistir al usuario y resolver su consulta de la mejor manera posible'}${followupSection}
+
+INSTRUCCIONES PARA LA GENERACIÓN DEL PROMPT:
+Por favor, redacta un conjunto de instrucciones claras, concisas y detalladas para la sección "Instrucciones de la Persona" de la configuración del agente IA.
+El prompt generado debe:
+- Ser directamente usable y copiable por el usuario para la configuración de su agente IA.
+- Definir claramente la identidad del agente usando el "Nombre o Rol del Agente" y el "Nombre de la Empresa o Contexto".
+- Guiar al agente para cumplir su "Objetivo Principal".
+- Reflejar el "Tono de Comunicación Deseado" en el estilo y lenguaje del prompt.
+- Incorporar la "Información Clave que el Agente DEBE Incluir o Conocer" en sus respuestas o comportamiento.
+- Instruir al agente sobre las "Cosas que DEBE EVITAR".
+- Si se especificaron "Herramientas", indicar cómo el agente podría interactuar con ellas o dirigir a los usuarios hacia ellas de forma natural.
+- Considerar las "Entradas Esperadas" y "Salidas Esperadas" para definir interacciones y respuestas modelo.
+- Orientar al agente hacia la "Principal Llamada a la Acción" de manera sutil y cuando sea apropiado.
+- IMPORTANTE: Incorporar toda la "Información Adicional y Detalles de Seguimiento" de manera natural en el prompt.
+- Ser lo suficientemente completo y detallado para que el agente tenga una base sólida para operar eficazmente.
+- Estar redactado en español.
+
+Evita cualquier comentario, introducción o explicación dirigida a mí (el asistente que te está pidiendo esto). Solo proporciona el texto del prompt para el agente IA, listo para ser usado.
+Comienza directamente con la definición del agente (Ej: "Eres [Nombre del Agente/Rol]...").
+
+Ejemplo de estructura (adapta el contenido y detalle según TODA la información proporcionada arriba):
+"""
+Eres ${agentNameOrRole || 'un asistente virtual'}, operando para ${companyOrContext || 'nuestra empresa'}. Tu principal objetivo es ${objective}.
+Tu tono debe ser consistentemente ${desiredTone || 'profesional y amigable'}.
+
+Al interactuar con los clientes, que principalmente son ${targetAudience || 'usuarios generales'}, ten en cuenta lo siguiente:
+
+Conocimiento y Menciones Clave:
+${keyInfoToInclude ? `- Asegúrate de mencionar o utilizar la siguiente información clave: ${keyInfoToInclude}` : '- No hay información clave específica predefinida para mencionar.'}
+
+Comportamiento a Evitar:
+${thingsToAvoid ? `- Absolutamente evita: ${thingsToAvoid}` : '- No hay comportamientos específicos a evitar predefinidos.'}
+
+Flujo de Conversación y Herramientas:
+Si el cliente pregunta por "${expectedInputs || 'información general'}", tu respuesta debería enfocarse en "${expectedOutputs || 'proporcionar asistencia general'}".
+${needsTools && tools ? `Para ello, puedes hacer uso de las siguientes herramientas: ${tools}. Explica su utilidad si es relevante.` : ''}
+
+Tu objetivo final es guiar al cliente hacia: ${primaryCallToAction || 'la resolución de su consulta'}.
+
+Recuerda siempre:
+1.  [Adaptar basado en objetivo y otras instrucciones]
+2.  [Adaptar basado en objetivo y otras instrucciones]
+"""
+Considera este ejemplo solo como una guía estructural. La calidad, detalle y personalización del prompt generado en base a TODOS los puntos anteriores es crucial.
+Si alguna información no fue proporcionada (ej. "Herramientas Específicas" si "Necesita herramientas" es no), omite esa sección o adáptala inteligentemente.`;
+
+    try {
+        console.log(`[Server][Gemini] Enviando meta-prompt mejorado para ${userId}. Longitud: ${metaPrompt.length}`);
+        const result = await serverGeminiModel.generateContent(metaPrompt);
+        const modelResponse = result.response; // Renamed to avoid conflict with http response
+        
+        if (!modelResponse || typeof modelResponse.text !== 'function') {
+            console.error(`[Server][Gemini] Respuesta inesperada de Gemini API para ${userId}.`);
+            return res.status(500).json({ success: false, message: "Respuesta inesperada del servicio de IA." });
+        }
+        
+        const generatedPrompt = modelResponse.text();
+
+        if (!generatedPrompt) {
+            console.error(`[Server][Gemini] Gemini no generó contenido para ${userId} con el prompt mejorado.`);
+            return res.status(500).json({ success: false, message: "La IA no pudo generar el prompt en este momento (respuesta vacía)." });
+        }
+
+        console.log(`[Server][Gemini] Prompt (mejorado) generado para ${userId} (longitud: ${generatedPrompt.length}):`, generatedPrompt.substring(0, 200) + "...");
+        res.json({ success: true, generatedPrompt: generatedPrompt.trim() });
+
+    } catch (error) {
+        console.error(`[Server][Gemini] Error generando prompt mejorado para ${userId}:`, error);
+        // Check if error.response exists and has promptFeedback (for Gemini specific errors)
+        if (error.response && error.response.promptFeedback && error.response.promptFeedback.blockReason) {
+            console.error("[Server][Gemini] Prompt Feedback:", JSON.stringify(error.response.promptFeedback, null, 2));
+            return res.status(400).json({ 
+                success: false, 
+                message: `La IA no pudo generar el prompt debido a restricciones de contenido: ${error.response.promptFeedback.blockReason}. Intenta reformular tus entradas.` 
+            });
+        } else if (error.message && (error.message.includes('SAFETY') || error.message.includes('blockReason'))) { // More generic check for safety messages
+            return res.status(400).json({
+                 success: false,
+                 message: "La IA no pudo generar el prompt debido a restricciones de contenido. Intenta reformular tus entradas."
+            });
+        }
+        // Generic error
+        res.status(500).json({ success: false, message: "Error interno al comunicarse con el servicio de IA para generar el prompt mejorado." });
+    }
+});
+// === FIN NUEVO ENDPOINT ===
+
+// === ENDPOINT PARA GENERAR PREGUNTAS DE SEGUIMIENTO PARA EL PROMPT ===
+app.post('/users/:userId/generate-followup-questions', authenticateApiKey, async (req, res) => {
+    const userId = req.params.userId;
+    // Obtener las respuestas iniciales del usuario
+    const {
+        objective, needsTools, tools, agentNameOrRole, 
+        companyOrContext, targetAudience, desiredTone
+    } = req.body;
+
+    console.log(`[Server] POST /users/${userId}/generate-followup-questions - Received data:`, req.body);
+
+    if (!serverGeminiModel) {
+        return res.status(503).json({ success: false, message: "Servicio de IA no disponible en este momento." });
+    }
+
+    if (!objective) {
+        return res.status(400).json({ success: false, message: "El objetivo del prompt es requerido." });
+    }
+
+    // Construir el prompt para generar preguntas de seguimiento
+    const followupPrompt = `Como experto en IA, necesito que generes preguntas de seguimiento personalizadas para mejorar un prompt de IA.
+El usuario ha proporcionado la siguiente información inicial:
+
+1. Objetivo Principal: "${objective}"
+2. Nombre/Rol del Agente: "${agentNameOrRole || 'No especificado'}"
+3. Empresa/Contexto: "${companyOrContext || 'No especificado'}"
+4. Audiencia Objetivo: "${targetAudience || 'No especificada'}"
+5. Tono Deseado: "${desiredTone || 'No especificado'}"
+6. ¿Necesita Herramientas?: ${needsTools ? 'Sí' : 'No'}
+7. Herramientas Mencionadas: "${tools || 'Ninguna'}"
+
+Basado en esta información inicial, genera 4-6 preguntas de seguimiento específicas que nos ayuden a:
+1. Profundizar en áreas que el usuario no ha detallado suficientemente
+2. Explorar aspectos que el usuario podría no haber considerado pero serían valiosos para el prompt
+3. Obtener ejemplos concretos de casos de uso o escenarios
+
+Devuelve las preguntas en formato JSON con esta estructura:
+{
+  "questions": [
+    {
+      "id": "q1",
+      "question": "Texto de la pregunta 1",
+      "type": "text|textarea|select|radio|checkbox",
+      "options": ["opción1", "opción2"] // Solo para select, radio o checkbox
+    },
+    ...
+  ]
+}
+
+Para las preguntas, considera:
+- Si mencionaron un público objetivo específico, pregunta por ejemplos concretos de consultas típicas de ese público
+- Si mencionaron herramientas, pregunta sobre flujos de trabajo o integraciones específicas
+- Si el objetivo es general, solicita escenarios o casos de uso concretos
+- Pregunta por restricciones o limitaciones importantes
+- Solicita ejemplos de lo que considerarían respuestas ideales
+
+IMPORTANTE: 
+- Devuelve SOLAMENTE el objeto JSON, sin texto adicional antes o después.
+- No repitas preguntas sobre información que ya tenemos (como objetivo general o tono).
+- Genera preguntas contextualmente relevantes al caso específico.
+- Para preguntas con respuestas cortas, usa type: "text"
+- Para respuestas largas, usa type: "textarea"
+- Para selecciones múltiples, usa type: "checkbox" con opciones relevantes
+- Para selecciones únicas, usa type: "radio" o "select" con opciones pertinentes`;
+
+    try {
+        console.log(`[Server][Gemini] Generando preguntas de seguimiento para ${userId}`);
+        const result = await serverGeminiModel.generateContent(followupPrompt);
+        const modelResponse = result.response;
+        
+        if (!modelResponse || typeof modelResponse.text !== 'function') {
+            console.error(`[Server][Gemini] Respuesta inesperada de Gemini API para ${userId}`);
+            return res.status(500).json({ success: false, message: "Respuesta inesperada del servicio de IA." });
+        }
+        
+        const generatedText = modelResponse.text();
+
+        if (!generatedText) {
+            console.error(`[Server][Gemini] Gemini no generó contenido para ${userId}`);
+            return res.status(500).json({ success: false, message: "La IA no pudo generar preguntas de seguimiento." });
+        }
+
+        // Intentar parsear el JSON generado
+        try {
+            let jsonToParse = generatedText.trim();
+            
+            // More robust cleaning using regex to extract content between ```json and ```
+            const regex = /```json\s*([\s\S]*?)\s*```/;
+            const match = jsonToParse.match(regex);
+            
+            if (match && match[1]) {
+                jsonToParse = match[1].trim();
+            } else {
+                // Fallback if regex doesn't match, try simple trim for cases where only ``` is present or no backticks
+                if (jsonToParse.startsWith("```")) {
+                    jsonToParse = jsonToParse.substring(3);
+                }
+                if (jsonToParse.endsWith("```")) {
+                    jsonToParse = jsonToParse.substring(0, jsonToParse.length - 3);
+                }
+                jsonToParse = jsonToParse.trim();
+            }
+
+            const questionsObject = JSON.parse(jsonToParse); // Parse the cleaned string
+            
+            // Validación básica del formato
+            if (!questionsObject.questions || !Array.isArray(questionsObject.questions)) {
+                throw new Error("Formato JSON inválido: falta array 'questions'");
+            }
+            
+            console.log(`[Server][Gemini] Generadas ${questionsObject.questions.length} preguntas de seguimiento para ${userId}`);
+            res.json({ 
+                success: true, 
+                followupQuestions: questionsObject.questions 
+            });
+        } catch (jsonError) {
+            console.error(`[Server][Gemini] Error parseando JSON de preguntas para ${userId}:`, jsonError);
+            // Intentar recuperar y formatear si el output no es JSON válido
+            return res.status(500).json({ 
+                success: false,
+                message: "Error procesando las preguntas generadas. El formato no es válido.",
+                raw: generatedText.substring(0, 1000) // Devolver texto crudo para diagnóstico
+            });
+        }
+
+    } catch (error) {
+        console.error(`[Server][Gemini] Error generando preguntas de seguimiento para ${userId}:`, error);
+        if (error.response && error.response.promptFeedback) {
+            return res.status(400).json({ 
+                success: false, 
+                message: `Error en el servicio de IA: ${error.response.promptFeedback.blockReason || 'Restricción de contenido'}`
+            });
+        }
+        res.status(500).json({ success: false, message: "Error interno al comunicarse con el servicio de IA." });
+    }
+});
+// === FIN ENDPOINT PARA PREGUNTAS DE SEGUIMIENTO ===

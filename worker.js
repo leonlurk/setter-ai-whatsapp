@@ -415,12 +415,17 @@ async function executeSteps(stepsToExecute, context) {
         // console.log(`[Worker ${userId}][Flow Engine] Procesando paso tipo: ${step.type}`); // Log detallado
         switch (step.type) {
             case 'send_message':
-                if (step.content) {
-                    const resolvedContent = resolveVariables(step.content, context);
+                if (step.value) { // MODIFIED: Check for step.value instead of step.content
+                    const resolvedContent = resolveVariables(step.value, context); // MODIFIED: Use step.value
                     console.log(`   -> Ejecutando send_message: "${resolvedContent.substring(0, 30)}..."`);
                     try {
-                        await randomDelay();
-                        // Usar la nueva función unificada para enviar mensajes del bot
+                        // Apply delay if specified and is a positive number
+                        if (step.delay && typeof step.delay === 'number' && step.delay > 0) {
+                            console.log(`   -> [Delay] Esperando ${step.delay} segundos antes de enviar mensaje...`);
+                            await new Promise(resolve => setTimeout(resolve, step.delay * 1000));
+                        } else {
+                            await randomDelay(); // Keep existing random delay if no specific step delay
+                        }
                         await sendBotMessage(context.message.from, resolvedContent, "Flow");
                         console.log(`   -> Mensaje de flujo enviado y guardado correctamente.`);
                     } catch (sendError) {
@@ -428,7 +433,47 @@ async function executeSteps(stepsToExecute, context) {
                          sendErrorInfo(`Error enviando mensaje de flujo: ${sendError.message}`);
                     }
                 } else {
-                    console.warn(`   -> Paso send_message sin 'content'. Saltando.`);
+                    console.warn(`   -> Paso send_message sin 'value' (contenido). Saltando.`); // MODIFIED: Warning message
+                }
+                break;
+
+            case 'assign_tag': // MODIFIED: Implemented assign_tag logic
+                if (step.value) {
+                    const tagName = resolveVariables(step.value, context);
+                    const chatId = context.message.from; // contact's ID
+                    console.log(`   -> Ejecutando assign_tag: Asignar etiqueta "${tagName}" al contacto ${chatId}`);
+                    
+                    try {
+                       const chatDocRef = firestoreDbWorker.collection('users').doc(userId).collection('chats').doc(chatId);
+                       // Use set with merge: true to create the document if it doesn't exist, or update if it does.
+                       await chatDocRef.set({ contactTags: admin.firestore.FieldValue.arrayUnion(tagName) }, { merge: true });
+                       console.log(`      -> Etiqueta "${tagName}" asignada/actualizada con éxito a ${chatId}.`);
+                    } catch (tagError) {
+                       console.error(`      -> Error asignando etiqueta "${tagName}" a ${chatId}:`, tagError);
+                       sendErrorInfo(`Error asignando etiqueta de flujo: ${tagError.message}`);
+                    }
+
+                    if (step.delay && typeof step.delay === 'number' && step.delay > 0) {
+                        console.log(`   -> [Delay] Post-asignación de etiqueta, esperando ${step.delay} segundos...`);
+                        await new Promise(resolve => setTimeout(resolve, step.delay * 1000));
+                    }
+                } else {
+                    console.warn(`   -> Paso assign_tag sin 'value' (nombre de etiqueta). Saltando.`);
+                }
+                break;
+
+            case 'notify_agent': 
+                if (step.value) {
+                    const notificationMessage = resolveVariables(step.value, context);
+                    console.log(`   -> Ejecutando notify_agent: Notificar con mensaje "${notificationMessage.substring(0, 50)}..."`);
+                    // TODO: Implement actual agent notification logic here (e.g., send internal alert, email)
+                    if (step.delay && typeof step.delay === 'number' && step.delay > 0) {
+                        console.log(`   -> [Delay] (Placeholder for notify_agent) Esperando ${step.delay} segundos...`);
+                        await new Promise(resolve => setTimeout(resolve, step.delay * 1000));
+                    }
+                    console.log(`   -> (Placeholder) Lógica de notificación a agente completada.`);
+                } else {
+                    console.warn(`   -> Paso notify_agent sin 'value' (mensaje de notificación). Saltando.`);
                 }
                 break;
 
