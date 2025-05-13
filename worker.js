@@ -1048,7 +1048,70 @@ process.on('message', async (message) => { // <-- Convertido a async para poder 
     switch (message.type) {
         case 'COMMAND':
             // Let handleCommand manage the flag if it includes SWITCH_AGENT
+            // <<< MODIFIED: Handle SEND_MESSAGE directly here >>>
+            if (message.command === 'SEND_MESSAGE' && message.payload) {
+                const { number, message: msgContent } = message.payload;
+                if (number && msgContent) {
+                    console.log(`[Worker ${userId}][IPC] Recibido comando SEND_MESSAGE via COMMAND. Destino: ${number}, Mensaje: "${msgContent.substring(0, 30)}..."`);
+                    if (client && typeof client.sendMessage === 'function') {
+                        client.sendMessage(number, msgContent)
+                            .then(async () => { // <<< ADDED async here
+                                console.log(`[Worker ${userId}][IPC] Comando SEND_MESSAGE ejecutado (client.sendMessage OK) para ${number}`);
+                                
+                                // <<< ADDED: Save outgoing HUMAN message to Firestore >>>
+                                try {
+                                    const chatDocRef = firestoreDbWorker.collection('users').doc(userId).collection('chats').doc(number); // 'number' is the chatId here
+                                    const timestamp = admin.firestore.FieldValue.serverTimestamp();
+                                    const messageData = {
+                                        from: `me (HUMAN - ${userId})`, // Indicate human origin
+                                        to: number,
+                                        body: msgContent,
+                                        timestamp: timestamp,
+                                        isFromMe: true,
+                                        isAutoReply: false, // Explicitly false for human messages
+                                        origin: 'human' // Set origin
+                                    };
+                                    
+                                    // Ensure collections exist (optional, can be slow)
+                                    // await ensureChatCollections(number); 
+
+                                    // Save to messages_human
+                                    await chatDocRef.collection('messages_human').add(messageData);
+                                    
+                                    // Save to messages_all
+                                    await chatDocRef.collection('messages_all').add(messageData);
+
+                                    // Update chat metadata (last message, timestamp)
+                                    await chatDocRef.set({
+                                        lastHumanMessageTimestamp: timestamp, // Track last human activity
+                                        lastMessageContent: msgContent,
+                                        lastMessageTimestamp: timestamp,
+                                        userIsActive: true // Mark user as active upon sending
+                                    }, { merge: true });
+
+                                    console.log(`[Worker ${userId}][IPC][DB] Mensaje HUMANO saliente guardado en Firestore para chat ${number}`);
+
+                                } catch (dbError) {
+                                     console.error(`[Worker ${userId}][IPC][DB Error] Error guardando mensaje HUMANO saliente en Firestore para ${number}:`, dbError);
+                                     // Should we notify master? Maybe not critical path.
+                                }
+                                // <<< END ADDED >>>
+
+                            })
+                            .catch(err => {
+                                console.error(`[Worker ${userId}][IPC] Error ejecutando client.sendMessage para ${number}:`, err);
+                                // Optional: notify master of send failure?
+                            });
+                    } else {
+                         console.error(`[Worker ${userId}][IPC] Error: client no listo o sendMessage no es función al intentar enviar a ${number}.`);
+                    }
+                } else {
+                     console.error(`[Worker ${userId}][IPC] Comando SEND_MESSAGE recibido con payload inválido:`, message.payload);
+                }
+            } else {
+                 // Delegate other commands to handleCommand if needed, or handle directly
             handleCommand(message.command, message.payload);
+            }
             break;
         case 'SWITCH_AGENT':
             console.log(`[Worker ${userId}][IPC] Recibido comando SWITCH_AGENT. Payload:`, JSON.stringify(message.payload));
