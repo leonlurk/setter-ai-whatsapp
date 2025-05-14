@@ -152,12 +152,10 @@ const authenticateApiKey = (req, res, next) => {
 
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res
-      .status(401)
-      .json({
-        success: false,
-        message: "Unauthorized: Missing or invalid Authorization header.",
-      });
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized: Missing or invalid Authorization header.",
+    });
   }
 
   const providedKey = authHeader.split(" ")[1];
@@ -965,12 +963,10 @@ async function handleWorkerMessage(userId, message) {
 app.post("/users", async (req, res) => {
   const { userId } = req.body;
   if (!userId || !userId.trim()) {
-    return res
-      .status(400)
-      .json({
-        success: false,
-        message: "userId es requerido y no puede estar vacío.",
-      });
+    return res.status(400).json({
+      success: false,
+      message: "userId es requerido y no puede estar vacío.",
+    });
   }
   const trimmedUserId = userId.trim();
   console.log(
@@ -999,13 +995,11 @@ app.post("/users", async (req, res) => {
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
       console.log(`[Server] Usuario ${trimmedUserId} registrado en Firestore.`);
-      res
-        .status(201)
-        .json({
-          success: true,
-          message: "Usuario registrado con éxito.",
-          userId: trimmedUserId,
-        });
+      res.status(201).json({
+        success: true,
+        message: "Usuario registrado con éxito.",
+        userId: trimmedUserId,
+      });
     }
   } catch (err) {
     console.error(
@@ -1091,13 +1085,11 @@ app.post("/users/:userId/connect", async (req, res) => {
         console.log(
           `[Server] Petición connect para ${userId} pero worker ya está activo.`
         );
-        return res
-          .status(200)
-          .json({
-            success: true,
-            message: "La conexión ya está activa o en proceso.",
-            currentStatus: userData.status,
-          });
+        return res.status(200).json({
+          success: true,
+          message: "La conexión ya está activa o en proceso.",
+          currentStatus: userData.status,
+        });
       }
       console.warn(
         `[Server] Inconsistencia detectada: Firestore dice ${userData.status} para ${userId} pero no hay worker activo. Intentando iniciar.`
@@ -1107,22 +1099,18 @@ app.post("/users/:userId/connect", async (req, res) => {
     // Intentar iniciar el worker (ahora es async)
     const workerInstance = await startWorker(userId);
     if (workerInstance) {
-      res
-        .status(202)
-        .json({
-          success: true,
-          message: "Solicitud de conexión recibida. Iniciando proceso...",
-        });
+      res.status(202).json({
+        success: true,
+        message: "Solicitud de conexión recibida. Iniciando proceso...",
+      });
     } else {
       // startWorker devolvió null (ej. script no encontrado o error crítico)
       // El estado ya debería haberse actualizado a error dentro de startWorker
-      res
-        .status(500)
-        .json({
-          success: false,
-          message:
-            "Error: No se pudo iniciar el worker. Revise los logs del servidor.",
-        });
+      res.status(500).json({
+        success: false,
+        message:
+          "Error: No se pudo iniciar el worker. Revise los logs del servidor.",
+      });
     }
   } catch (err) {
     console.error(
@@ -1287,12 +1275,10 @@ app.post("/users/:userId/send-message", async (req, res) => {
       console.warn(
         `[Server] Intento de enviar mensaje para ${userId} pero estado Firestore NO es 'connected' (es: ${currentStatus}).`
       );
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: `Worker para usuario ${userId} no está activo (estado: ${currentStatus}). Conéctese primero.`,
-        });
+      return res.status(400).json({
+        success: false,
+        message: `Worker para usuario ${userId} no está activo (estado: ${currentStatus}). Conéctese primero.`,
+      });
     }
 
     // Check if the worker process *itself* exists in memory (still needed for IPC)
@@ -1302,13 +1288,10 @@ app.post("/users/:userId/send-message", async (req, res) => {
       );
       // Attempt to clean up inconsistent state?
       // For now, return an error indicating internal inconsistency.
-      return res
-        .status(500)
-        .json({
-          success: false,
-          message:
-            "Error interno: Inconsistencia entre estado y proceso worker.",
-        });
+      return res.status(500).json({
+        success: false,
+        message: "Error interno: Inconsistencia entre estado y proceso worker.",
+      });
     }
 
     // If Firestore status is 'connected' AND worker process exists, proceed
@@ -1322,12 +1305,10 @@ app.post("/users/:userId/send-message", async (req, res) => {
       command: "SEND_MESSAGE",
       payload: { number: number.trim(), message: message.trim() },
     });
-    res
-      .status(202)
-      .json({
-        success: true,
-        message: "Comando de envío de mensaje enviado al worker.",
-      });
+    res.status(202).json({
+      success: true,
+      message: "Comando de envío de mensaje enviado al worker.",
+    });
   } catch (err) {
     console.error(
       "[Server][Firestore Error] Error verificando estado antes de enviar mensaje:",
@@ -1444,12 +1425,10 @@ app.post("/users/:userId/add-rule", async (req, res) => {
       .limit(1)
       .get();
     if (!duplicateQuery.empty) {
-      return res
-        .status(409)
-        .json({
-          success: false,
-          message: "Ya existe una regla con este trigger.",
-        });
+      return res.status(409).json({
+        success: false,
+        message: "Ya existe una regla con este trigger.",
+      });
     }
 
     const ruleId = uuidv4();
@@ -1556,12 +1535,10 @@ app.get("/users/:userId/gemini-starters", async (req, res) => {
       );
       return res.json({ success: true, data: [] });
     }
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Error interno al listar disparadores.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Error interno al listar disparadores.",
+    });
   }
 });
 
@@ -1597,12 +1574,10 @@ app.post("/users/:userId/add-gemini-starter", async (req, res) => {
       .limit(1)
       .get();
     if (!duplicateQuery.empty) {
-      return res
-        .status(409)
-        .json({
-          success: false,
-          message: "Ya existe un disparador con este trigger.",
-        });
+      return res.status(409).json({
+        success: false,
+        message: "Ya existe un disparador con este trigger.",
+      });
     }
 
     const starterId = uuidv4();
@@ -1624,24 +1599,20 @@ app.post("/users/:userId/add-gemini-starter", async (req, res) => {
       payload: { starters: updatedStartersData },
     });
 
-    res
-      .status(201)
-      .json({
-        success: true,
-        message: "Disparador añadido.",
-        data: newStarter,
-      });
+    res.status(201).json({
+      success: true,
+      message: "Disparador añadido.",
+      data: newStarter,
+    });
   } catch (err) {
     console.error(
       `[Server][Firestore Error] Error añadiendo starter para ${userId}:`,
       err
     );
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Error interno al guardar el disparador.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Error interno al guardar el disparador.",
+    });
   }
 });
 
@@ -1685,12 +1656,10 @@ app.delete("/users/:userId/gemini-starters/:starterId", async (req, res) => {
       `[Server][Firestore Error] Error eliminando starter ${starterId} para ${userId}:`,
       err
     );
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Error interno al eliminar el disparador.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Error interno al eliminar el disparador.",
+    });
   }
 });
 
@@ -1760,13 +1729,11 @@ app.post("/users/:userId/action-flows", async (req, res) => {
     !flowData.trigger ||
     !Array.isArray(flowData.steps)
   ) {
-    return res
-      .status(400)
-      .json({
-        success: false,
-        message:
-          "Datos del flujo inválidos. Se requiere name, trigger y steps (array).",
-      });
+    return res.status(400).json({
+      success: false,
+      message:
+        "Datos del flujo inválidos. Se requiere name, trigger y steps (array).",
+    });
   }
 
   const flowsCollectionRef = firestoreDb
@@ -1817,13 +1784,11 @@ app.post("/users/:userId/action-flows", async (req, res) => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    res
-      .status(201)
-      .json({
-        success: true,
-        message: "Flujo de acción creado.",
-        data: createdFlow,
-      });
+    res.status(201).json({
+      success: true,
+      message: "Flujo de acción creado.",
+      data: createdFlow,
+    });
   } catch (err) {
     console.error(
       `[Server][Firestore Error] Error creando flujo de acción para ${userId}:`,
@@ -1884,13 +1849,11 @@ app.put("/users/:userId/action-flows/:flowId", async (req, res) => {
     !updatedFlowData.trigger ||
     !Array.isArray(updatedFlowData.steps)
   ) {
-    return res
-      .status(400)
-      .json({
-        success: false,
-        message:
-          "Datos del flujo inválidos. Se requiere name, trigger y steps (array).",
-      });
+    return res.status(400).json({
+      success: false,
+      message:
+        "Datos del flujo inválidos. Se requiere name, trigger y steps (array).",
+    });
   }
 
   const flowDocRef = firestoreDb
@@ -1949,19 +1912,15 @@ app.put("/users/:userId/action-flows/:flowId", async (req, res) => {
     ); // <-- ACTUALIZAR LOG
     if (err.code === 5) {
       // Firestore NOT_FOUND
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: "Flujo de acción no encontrado para actualizar.",
-        });
-    }
-    res
-      .status(500)
-      .json({
+      return res.status(404).json({
         success: false,
-        message: "Error interno al guardar el flujo actualizado.",
+        message: "Flujo de acción no encontrado para actualizar.",
       });
+    }
+    res.status(500).json({
+      success: false,
+      message: "Error interno al guardar el flujo actualizado.",
+    });
   }
 });
 
@@ -1984,12 +1943,10 @@ app.delete("/users/:userId/action-flows/:flowId", async (req, res) => {
     // Verificar si existe antes de borrar
     const docSnap = await flowDocRef.get();
     if (!docSnap.exists) {
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: "Flujo de acción no encontrado para eliminar.",
-        });
+      return res.status(404).json({
+        success: false,
+        message: "Flujo de acción no encontrado para eliminar.",
+      });
     }
 
     await flowDocRef.delete();
@@ -2081,13 +2038,11 @@ app.post("/users/:userId/agents", async (req, res) => {
     !agentData.persona.name ||
     !agentData.knowledge
   ) {
-    return res
-      .status(400)
-      .json({
-        success: false,
-        message:
-          "Datos del agente inválidos. Se requiere al menos persona.name y knowledge.",
-      });
+    return res.status(400).json({
+      success: false,
+      message:
+        "Datos del agente inválidos. Se requiere al menos persona.name y knowledge.",
+    });
   }
   // Validar que knowledge sea un objeto (puede venir vacío)
   if (typeof agentData.knowledge !== "object" || agentData.knowledge === null) {
@@ -2124,13 +2079,11 @@ app.post("/users/:userId/agents", async (req, res) => {
     // Notificar al worker activo si coincide el userId (podría no estar activo)
     notifyWorker(userId, { type: "COMMAND", command: "RELOAD_AGENT_CONFIG" });
 
-    res
-      .status(201)
-      .json({
-        success: true,
-        message: "Agente creado.",
-        data: { ...newAgent, id: agentId },
-      }); // Devolver con ID
+    res.status(201).json({
+      success: true,
+      message: "Agente creado.",
+      data: { ...newAgent, id: agentId },
+    }); // Devolver con ID
   } catch (err) {
     console.error(
       `[Server][Firestore Error] Error creando agente para ${userId}:`,
@@ -2184,12 +2137,10 @@ app.put("/users/:userId/agents/:agentId", async (req, res) => {
     !updatedAgentData.persona.name ||
     !updatedAgentData.knowledge
   ) {
-    return res
-      .status(400)
-      .json({
-        success: false,
-        message: "Datos del agente inválidos para actualizar.",
-      });
+    return res.status(400).json({
+      success: false,
+      message: "Datos del agente inválidos para actualizar.",
+    });
   }
   // Validar que knowledge sea un objeto (puede venir vacío)
   if (
@@ -2254,19 +2205,15 @@ app.put("/users/:userId/agents/:agentId", async (req, res) => {
     );
     if (err.code === 5) {
       // Firestore NOT_FOUND
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: "Agente no encontrado para actualizar.",
-        });
-    }
-    res
-      .status(500)
-      .json({
+      return res.status(404).json({
         success: false,
-        message: "Error interno al guardar el agente actualizado.",
+        message: "Agente no encontrado para actualizar.",
       });
+    }
+    res.status(500).json({
+      success: false,
+      message: "Error interno al guardar el agente actualizado.",
+    });
   }
 });
 
@@ -2285,12 +2232,10 @@ app.delete("/users/:userId/agents/:agentId", async (req, res) => {
     // Verificar si existe antes de borrar
     const docSnap = await agentDocRef.get();
     if (!docSnap.exists) {
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: "Agente no encontrado para eliminar.",
-        });
+      return res.status(404).json({
+        success: false,
+        message: "Agente no encontrado para eliminar.",
+      });
     }
 
     // Verificar si es el agente activo y desasignarlo si lo es
@@ -2333,12 +2278,10 @@ app.delete("/users/:userId/agents/:agentId", async (req, res) => {
       `[Server][Firestore Error] Error eliminando agente ${agentId} para ${userId}:`,
       err
     );
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Error interno al eliminar el agente.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Error interno al eliminar el agente.",
+    });
   }
 });
 
@@ -2367,12 +2310,10 @@ app.put("/users/:userId/active-agent", async (req, res) => {
       const agentDocRef = userDocRef.collection("agents").doc(agentId);
       const agentDocSnap = await agentDocRef.get();
       if (!agentDocSnap.exists) {
-        return res
-          .status(404)
-          .json({
-            success: false,
-            message: `Agente con ID ${agentId} no encontrado para este usuario.`,
-          });
+        return res.status(404).json({
+          success: false,
+          message: `Agente con ID ${agentId} no encontrado para este usuario.`,
+        });
       }
       // <<< OBTENER CONFIG PARA PAYLOAD >>>
       agentConfigPayload = agentDocSnap.data();
@@ -2416,12 +2357,10 @@ app.put("/users/:userId/active-agent", async (req, res) => {
       `[Server][Firestore Error] Error estableciendo agente activo para ${userId}:`,
       err
     );
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Error interno al actualizar el agente activo.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Error interno al actualizar el agente activo.",
+    });
   }
 });
 
@@ -2480,12 +2419,10 @@ app.get("/users/:userId/chats", async (req, res) => {
       err
     );
     // Handle specific errors like missing indices if needed
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Error interno al obtener la lista de chats.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Error interno al obtener la lista de chats.",
+    });
   }
 });
 // <<< END: API Endpoint to List Chats >>>
@@ -2528,13 +2465,11 @@ app.get("/users/:userId/chats/:chatId/messages", async (req, res) => {
         console.warn(
           `[Server] Invalid 'before' timestamp format: ${beforeTimestampStr}. Ignoring pagination.`
         );
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message:
-              "Formato de timestamp inválido para paginación (use ISO 8601).",
-          });
+        return res.status(400).json({
+          success: false,
+          message:
+            "Formato de timestamp inválido para paginación (use ISO 8601).",
+        });
       }
     }
 
@@ -2611,21 +2546,17 @@ app.get("/users/:userId/chats/:chatId/messages", async (req, res) => {
       console.error(
         `[Server][Firestore Error] Missing index for chat message query: ${err.message}`
       );
-      return res
-        .status(500)
-        .json({
-          success: false,
-          message:
-            "Error interno: Falta un índice de base de datos. Contacte al administrador.",
-          code: "INDEX_REQUIRED",
-        });
-    }
-    res
-      .status(500)
-      .json({
+      return res.status(500).json({
         success: false,
-        message: "Error interno al obtener los mensajes del chat.",
+        message:
+          "Error interno: Falta un índice de base de datos. Contacte al administrador.",
+        code: "INDEX_REQUIRED",
       });
+    }
+    res.status(500).json({
+      success: false,
+      message: "Error interno al obtener los mensajes del chat.",
+    });
   }
 });
 // <<< END: API Endpoint to Get Messages for a Chat >>>
@@ -2640,12 +2571,10 @@ app.put("/users/:userId/chats/:chatId/contact-name", async (req, res) => {
 
   if (name === undefined || typeof name !== "string") {
     // Allow empty string to clear the name
-    return res
-      .status(400)
-      .json({
-        success: false,
-        message: 'El campo "name" (string) es requerido en el body.',
-      });
+    return res.status(400).json({
+      success: false,
+      message: 'El campo "name" (string) es requerido en el body.',
+    });
   }
 
   const chatDocRef = firestoreDb
@@ -2680,12 +2609,10 @@ app.put("/users/:userId/chats/:chatId/contact-name", async (req, res) => {
       `[Server][Firestore Error] Actualizando nombre de contacto para chat ${chatId}:`,
       err
     );
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Error interno al actualizar el nombre del contacto.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Error interno al actualizar el nombre del contacto.",
+    });
   }
 });
 // <<< END: NEW API Endpoint to Update Contact Display Name >>>
@@ -2818,21 +2745,17 @@ app.post(
     );
 
     if (!serverGeminiModel) {
-      return res
-        .status(503)
-        .json({
-          success: false,
-          message: "Servicio de IA no disponible en este momento.",
-        });
+      return res.status(503).json({
+        success: false,
+        message: "Servicio de IA no disponible en este momento.",
+      });
     }
 
     if (!objective) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "El objetivo del prompt es requerido.",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "El objetivo del prompt es requerido.",
+      });
     }
 
     // Generar sección de información de seguimiento si existe
@@ -2978,12 +2901,10 @@ Si alguna información no fue proporcionada (ej. "Herramientas Específicas" si 
         console.error(
           `[Server][Gemini] Respuesta inesperada de Gemini API para ${userId}.`
         );
-        return res
-          .status(500)
-          .json({
-            success: false,
-            message: "Respuesta inesperada del servicio de IA.",
-          });
+        return res.status(500).json({
+          success: false,
+          message: "Respuesta inesperada del servicio de IA.",
+        });
       }
 
       const generatedPrompt = modelResponse.text();
@@ -2992,13 +2913,11 @@ Si alguna información no fue proporcionada (ej. "Herramientas Específicas" si 
         console.error(
           `[Server][Gemini] Gemini no generó contenido para ${userId} con el prompt mejorado.`
         );
-        return res
-          .status(500)
-          .json({
-            success: false,
-            message:
-              "La IA no pudo generar el prompt en este momento (respuesta vacía).",
-          });
+        return res.status(500).json({
+          success: false,
+          message:
+            "La IA no pudo generar el prompt en este momento (respuesta vacía).",
+        });
       }
 
       console.log(
@@ -3038,13 +2957,11 @@ Si alguna información no fue proporcionada (ej. "Herramientas Específicas" si 
         });
       }
       // Generic error
-      res
-        .status(500)
-        .json({
-          success: false,
-          message:
-            "Error interno al comunicarse con el servicio de IA para generar el prompt mejorado.",
-        });
+      res.status(500).json({
+        success: false,
+        message:
+          "Error interno al comunicarse con el servicio de IA para generar el prompt mejorado.",
+      });
     }
   }
 );
@@ -3073,21 +2990,17 @@ app.post(
     );
 
     if (!serverGeminiModel) {
-      return res
-        .status(503)
-        .json({
-          success: false,
-          message: "Servicio de IA no disponible en este momento.",
-        });
+      return res.status(503).json({
+        success: false,
+        message: "Servicio de IA no disponible en este momento.",
+      });
     }
 
     if (!objective) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "El objetivo del prompt es requerido.",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "El objetivo del prompt es requerido.",
+      });
     }
 
     // Construir el prompt para generar preguntas de seguimiento
@@ -3147,12 +3060,10 @@ IMPORTANTE:
         console.error(
           `[Server][Gemini] Respuesta inesperada de Gemini API para ${userId}`
         );
-        return res
-          .status(500)
-          .json({
-            success: false,
-            message: "Respuesta inesperada del servicio de IA.",
-          });
+        return res.status(500).json({
+          success: false,
+          message: "Respuesta inesperada del servicio de IA.",
+        });
       }
 
       const generatedText = modelResponse.text();
@@ -3161,12 +3072,10 @@ IMPORTANTE:
         console.error(
           `[Server][Gemini] Gemini no generó contenido para ${userId}`
         );
-        return res
-          .status(500)
-          .json({
-            success: false,
-            message: "La IA no pudo generar preguntas de seguimiento.",
-          });
+        return res.status(500).json({
+          success: false,
+          message: "La IA no pudo generar preguntas de seguimiento.",
+        });
       }
 
       // Intentar parsear el JSON generado
@@ -3234,12 +3143,10 @@ IMPORTANTE:
           }`,
         });
       }
-      res
-        .status(500)
-        .json({
-          success: false,
-          message: "Error interno al comunicarse con el servicio de IA.",
-        });
+      res.status(500).json({
+        success: false,
+        message: "Error interno al comunicarse con el servicio de IA.",
+      });
     }
   }
 );
@@ -3288,24 +3195,20 @@ app.post("/users/:userId/kanban-boards", async (req, res) => {
     console.log(
       `[Server] Tablero Kanban creado para ${userId}: ${boardId} - ${newBoard.name}`
     );
-    res
-      .status(201)
-      .json({
-        success: true,
-        message: "Tablero Kanban creado.",
-        data: newBoard,
-      });
+    res.status(201).json({
+      success: true,
+      message: "Tablero Kanban creado.",
+      data: newBoard,
+    });
   } catch (err) {
     console.error(
       `[Server][Firestore Error] Creando tablero Kanban para ${userId}:`,
       err
     );
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Error interno al crear el tablero Kanban.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Error interno al crear el tablero Kanban.",
+    });
   }
 });
 
@@ -3352,12 +3255,10 @@ app.get("/users/:userId/kanban-boards", async (req, res) => {
       `[Server][Firestore Error] Listando tableros Kanban para ${userId}:`,
       err
     );
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Error interno al listar tableros Kanban.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Error interno al listar tableros Kanban.",
+    });
   }
 });
 
@@ -3389,12 +3290,10 @@ app.get("/users/:userId/kanban-boards/:boardId", async (req, res) => {
       `[Server][Firestore Error] Obteniendo tablero ${boardId} para ${userId}:`,
       err
     );
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Error interno al obtener el tablero.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Error interno al obtener el tablero.",
+    });
   }
 });
 
@@ -3405,13 +3304,11 @@ app.put("/users/:userId/kanban-boards/:boardId", async (req, res) => {
   console.log(`[Server] PUT /users/${userId}/kanban-boards/${boardId}`);
 
   if (!name && !columns_order) {
-    return res
-      .status(400)
-      .json({
-        success: false,
-        message:
-          "Se requiere al menos un campo para actualizar (name o columns_order).",
-      });
+    return res.status(400).json({
+      success: false,
+      message:
+        "Se requiere al menos un campo para actualizar (name o columns_order).",
+    });
   }
 
   const boardDocRef = firestoreDb
@@ -3430,12 +3327,10 @@ app.put("/users/:userId/kanban-boards/:boardId", async (req, res) => {
       updateData.columns_order = columns_order;
     }
     if (Object.keys(updateData).length === 0) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Ningún dato válido proporcionado para la actualización.",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Ningún dato válido proporcionado para la actualización.",
+      });
     }
 
     updateData.updatedAt = admin.firestore.FieldValue.serverTimestamp();
@@ -3457,19 +3352,15 @@ app.put("/users/:userId/kanban-boards/:boardId", async (req, res) => {
     );
     if (err.code === 5) {
       // Firestore NOT_FOUND
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: "Tablero Kanban no encontrado para actualizar.",
-        });
-    }
-    res
-      .status(500)
-      .json({
+      return res.status(404).json({
         success: false,
-        message: "Error interno al actualizar el tablero.",
+        message: "Tablero Kanban no encontrado para actualizar.",
       });
+    }
+    res.status(500).json({
+      success: false,
+      message: "Error interno al actualizar el tablero.",
+    });
   }
 });
 
@@ -3512,12 +3403,10 @@ app.delete("/users/:userId/kanban-boards/:boardId", async (req, res) => {
       `[Server][Firestore Error] Eliminando tablero ${boardId} para ${userId}:`,
       err
     );
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Error interno al eliminar el tablero.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Error interno al eliminar el tablero.",
+    });
   }
 });
 
@@ -3534,12 +3423,10 @@ app.post("/users/:userId/kanban-boards/:boardId/columns", async (req, res) => {
   );
 
   if (!name || !name.trim()) {
-    return res
-      .status(400)
-      .json({
-        success: false,
-        message: "El nombre de la columna es requerido.",
-      });
+    return res.status(400).json({
+      success: false,
+      message: "El nombre de la columna es requerido.",
+    });
   }
 
   const boardDocRef = firestoreDb
@@ -3552,12 +3439,10 @@ app.post("/users/:userId/kanban-boards/:boardId/columns", async (req, res) => {
   try {
     const boardDocSnap = await boardDocRef.get();
     if (!boardDocSnap.exists) {
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: "Tablero Kanban no encontrado para añadir columna.",
-        });
+      return res.status(404).json({
+        success: false,
+        message: "Tablero Kanban no encontrado para añadir columna.",
+      });
     }
 
     const columnId = uuidv4();
@@ -3582,24 +3467,20 @@ app.post("/users/:userId/kanban-boards/:boardId/columns", async (req, res) => {
     console.log(
       `[Server] Columna Kanban creada para tablero ${boardId}: ${columnId} - ${newColumn.name}, Tipo Etapa: ${newColumn.stageType}`
     );
-    res
-      .status(201)
-      .json({
-        success: true,
-        message: "Columna Kanban creada.",
-        data: newColumn,
-      });
+    res.status(201).json({
+      success: true,
+      message: "Columna Kanban creada.",
+      data: newColumn,
+    });
   } catch (err) {
     console.error(
       `[Server][Firestore Error] Creando columna Kanban para tablero ${boardId}:`,
       err
     );
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Error interno al crear la columna Kanban.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Error interno al crear la columna Kanban.",
+    });
   }
 });
 
@@ -3672,12 +3553,10 @@ app.put(
 
     if ((!name || !name.trim()) && stageType === undefined) {
       // Check if stageType is undefined to allow setting it to null
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Se requiere nombre o stageType para actualizar.",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Se requiere nombre o stageType para actualizar.",
+      });
     }
 
     const columnDocRef = firestoreDb
@@ -3702,13 +3581,11 @@ app.put(
       }
 
       if (Object.keys(updateData).length === 1 && updateData.updatedAt) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message:
-              "Ningún dato válido proporcionado para la actualización (solo timestamp).",
-          });
+        return res.status(400).json({
+          success: false,
+          message:
+            "Ningún dato válido proporcionado para la actualización (solo timestamp).",
+        });
       }
 
       await columnDocRef.update(updateData); // Falla si no existe
@@ -3726,19 +3603,15 @@ app.put(
       );
       if (err.code === 5) {
         // Firestore NOT_FOUND
-        return res
-          .status(404)
-          .json({
-            success: false,
-            message: "Columna Kanban no encontrada para actualizar.",
-          });
-      }
-      res
-        .status(500)
-        .json({
+        return res.status(404).json({
           success: false,
-          message: "Error interno al actualizar la columna.",
+          message: "Columna Kanban no encontrada para actualizar.",
         });
+      }
+      res.status(500).json({
+        success: false,
+        message: "Error interno al actualizar la columna.",
+      });
     }
   }
 );
@@ -3783,12 +3656,10 @@ app.delete(
         `[Server][Firestore Error] Eliminando columna ${columnId}:`,
         err
       );
-      res
-        .status(500)
-        .json({
-          success: false,
-          message: "Error interno al eliminar la columna.",
-        });
+      res.status(500).json({
+        success: false,
+        message: "Error interno al eliminar la columna.",
+      });
     }
   }
 );
@@ -3809,22 +3680,18 @@ app.put(
     );
 
     if (!boardId && columnId) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Se requiere boardId si se especifica columnId.",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Se requiere boardId si se especifica columnId.",
+      });
     }
 
     // <<< ADDED: Validate contactName if provided >>>
     if (contactName !== undefined && typeof contactName !== "string") {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: 'Si se provee "contactName", debe ser un string.',
-        });
+      return res.status(400).json({
+        success: false,
+        message: 'Si se provee "contactName", debe ser un string.',
+      });
     }
 
     const chatDocRef = firestoreDb
@@ -3851,12 +3718,10 @@ app.put(
           .doc(columnId);
         const columnDocSnap = await columnDocRef.get();
         if (!columnDocSnap.exists) {
-          return res
-            .status(404)
-            .json({
-              success: false,
-              message: "Columna Kanban o Tablero no encontrado.",
-            });
+          return res.status(404).json({
+            success: false,
+            message: "Columna Kanban o Tablero no encontrado.",
+          });
         }
       } else if (boardId && !columnId) {
         const boardToValidateRef = firestoreDb
@@ -3866,13 +3731,10 @@ app.put(
           .doc(boardId);
         const boardToValidateSnap = await boardToValidateRef.get();
         if (!boardToValidateSnap.exists) {
-          return res
-            .status(404)
-            .json({
-              success: false,
-              message:
-                "Tablero Kanban no encontrado para desasignar la columna.",
-            });
+          return res.status(404).json({
+            success: false,
+            message: "Tablero Kanban no encontrado para desasignar la columna.",
+          });
         }
       }
 
@@ -3909,19 +3771,15 @@ app.put(
         err
       );
       if (err.code === 5) {
-        return res
-          .status(404)
-          .json({
-            success: false,
-            message: "Error: Chat, tablero o columna no encontrado.",
-          });
-      }
-      res
-        .status(500)
-        .json({
+        return res.status(404).json({
           success: false,
-          message: "Error interno al asignar chat a columna Kanban.",
+          message: "Error: Chat, tablero o columna no encontrado.",
         });
+      }
+      res.status(500).json({
+        success: false,
+        message: "Error interno al asignar chat a columna Kanban.",
+      });
     }
   }
 );
@@ -4056,21 +3914,17 @@ app.get(
         console.error(
           `[Server][Firestore Error] Posiblemente falte un índice en la colección 'chats' para 'kanbanBoardId' y/o 'lastMessageTimestamp'. Mensaje: ${err.message}`
         );
-        return res
-          .status(500)
-          .json({
-            success: false,
-            message:
-              "Error interno: Falta un índice de base de datos. Contacte al administrador.",
-            code: "INDEX_REQUIRED_CHATS_KANBAN",
-          });
-      }
-      res
-        .status(500)
-        .json({
+        return res.status(500).json({
           success: false,
-          message: "Error interno al obtener chats por columna.",
+          message:
+            "Error interno: Falta un índice de base de datos. Contacte al administrador.",
+          code: "INDEX_REQUIRED_CHATS_KANBAN",
         });
+      }
+      res.status(500).json({
+        success: false,
+        message: "Error interno al obtener chats por columna.",
+      });
     }
   }
 );
@@ -4082,12 +3936,10 @@ app.post("/api/instagram/generate-reply", async (req, res) => {
   const { message, history, instagramUserId, threadId, agentId } = req.body;
 
   if (!message || !instagramUserId || !threadId) {
-    return res
-      .status(400)
-      .json({
-        success: false,
-        error: "Missing required fields: message, instagramUserId, threadId",
-      });
+    return res.status(400).json({
+      success: false,
+      error: "Missing required fields: message, instagramUserId, threadId",
+    });
   }
 
   // History is optional, but recommended
@@ -4133,13 +3985,11 @@ app.post("/api/instagram/generate-reply", async (req, res) => {
       `[Server][Instagram][${instagramUserId}-${threadId}] Error in /api/instagram/generate-reply:`,
       error
     );
-    res
-      .status(500)
-      .json({
-        success: false,
-        error:
-          error.message || "Internal server error processing Gemini request.",
-      });
+    res.status(500).json({
+      success: false,
+      error:
+        error.message || "Internal server error processing Gemini request.",
+    });
   }
 });
 
