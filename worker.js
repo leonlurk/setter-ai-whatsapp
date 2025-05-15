@@ -22,6 +22,9 @@ console.log(`[Worker ${userId}] Iniciando worker...`);
 let initialActiveAgentId = process.argv[3] || null;
 // console.log(`[Worker ${userId}] Active Agent ID inicial: ${initialActiveAgentId || 'Ninguno (usará default)'}`); // Log movido
 
+// <<< AÑADIR: Variable global para control de estado de pausa >>>
+let botPauseState = false; // Por defecto, el bot no está pausado
+
 // --- Definición de Rutas y Archivos ---
 const USER_DATA_PATH = path.join(__dirname, 'data_v2', userId);
 const SESSION_PATH = path.join(USER_DATA_PATH, '.wwebjs_auth'); // Directorio para la sesión de WhatsApp
@@ -79,6 +82,9 @@ try {
          console.log(`[Worker ${userId}] Firebase Admin SDK already initialized.`);
     }
     firestoreDbWorker = admin.firestore();
+    
+    // Cargar estado de pausa después de inicializar Firestore
+    loadBotPauseState();
 } catch (error) {
     console.error(`[Worker ${userId}][ERROR CRÍTICO] Initializing Firebase Admin SDK in worker:`, error);
     // Notify master?
@@ -894,9 +900,12 @@ client.on('message', async (message) => {
         const userIsActive = await isUserActiveInChat(userId, sender);
         console.log(`[Worker ${userId}][PRESENCE CHECK v2] Resultado: ${userIsActive ? 'ACTIVO' : 'INACTIVO'} (${userIsActive ? 'no responder automáticamente' : 'responder automáticamente'})`);
 
-        // Si el usuario está inactivo, procesar respuestas automáticas
-        if (!userIsActive) {
-          console.log(`[Worker ${userId}][AUTO-REPLY v2] Usuario INACTIVO. Procesando posibles respuestas automáticas para: ${sender}`);
+        // <<< AÑADIR: Verificación de estado de pausa >>>
+        console.log(`[Worker ${userId}][PAUSE CHECK] Estado de pausa: ${botPauseState ? 'PAUSADO' : 'ACTIVO'}`);
+        
+        // Si el usuario está inactivo Y el bot NO está pausado, procesar respuestas automáticas
+        if (!userIsActive && !botPauseState) {
+          console.log(`[Worker ${userId}][AUTO-REPLY v2] Usuario INACTIVO y bot NO PAUSADO. Procesando posibles respuestas automáticas para: ${sender}`);
 
 
           // 1. Verificar si hay un flujo activado por el mensaje
@@ -1010,8 +1019,11 @@ client.on('message', async (message) => {
               // Flag removed - no reset needed
           }
         } else {
-          console.log(`[Worker ${userId}][AUTO-REPLY v2] Usuario ACTIVO. No se enviarán respuestas automáticas.`);
-          // Flag removed - no reset needed
+          if (userIsActive) {
+            console.log(`[Worker ${userId}][AUTO-REPLY v2] Usuario ACTIVO. No se enviarán respuestas automáticas.`);
+          } else if (botPauseState) {
+            console.log(`[Worker ${userId}][AUTO-REPLY v2] Bot PAUSADO. No se enviarán respuestas automáticas.`);
+          }
         }
       }
     } catch (dbError) {
@@ -1167,6 +1179,14 @@ process.on('message', async (message) => { // <-- Convertido a async para poder 
             console.log(`[Worker ${userId}][IPC] Limpieza de historial completada después de SWITCH_AGENT.`);
             // <<< ELIMINAR SETEO DE BANDERA >>>
             break;
+            
+        // <<< AÑADIR: Nuevo comando para pausar el bot >>>
+        case 'PAUSE_BOT':
+            console.log(`[Worker ${userId}][IPC] Recibido comando PAUSE_BOT.`);
+            const shouldPause = message.payload?.pause === true;
+            await updateBotPauseState(shouldPause);
+            break;
+            
         case 'INITIAL_CONFIG':
             console.log(`[Worker ${userId}] Recibida configuración inicial del Master.`);
             const configPayload = message.payload;
@@ -2204,3 +2224,40 @@ async function deleteQueryBatch(query, batchSize, resolve, reject) {
     }
 }
 // <<< FIN NUEVAS FUNCIONES >>>
+
+// <<< AÑADIR: Función para actualizar el estado de pausa >>>
+async function updateBotPauseState(isPaused) {
+    botPauseState = isPaused; // Actualizar variable en memoria
+    
+    // Persistir en Firestore para que sobreviva reinicios
+    if (firestoreDbWorker) {
+        try {
+            const statusDocRef = firestoreDbWorker.collection('users').doc(userId).collection('status').doc('whatsapp');
+            await statusDocRef.set({ 
+                botIsPaused: isPaused,
+                botPauseUpdatedAt: admin.firestore.FieldValue.serverTimestamp() 
+            }, { merge: true });
+            console.log(`[Worker ${userId}][PAUSE] Estado de pausa actualizado en Firestore: ${isPaused}`);
+        } catch (error) {
+            console.error(`[Worker ${userId}][PAUSE] Error al actualizar estado de pausa en Firestore:`, error);
+        }
+    }
+    
+    console.log(`[Worker ${userId}][PAUSE] Bot ${isPaused ? 'PAUSADO' : 'ACTIVADO'}`);
+}
+
+// <<< AÑADIR: Función para cargar el estado de pausa desde Firestore >>>
+async function loadBotPauseState() {
+    if (firestoreDbWorker) {
+        try {
+            const statusDocRef = firestoreDbWorker.collection('users').doc(userId).collection('status').doc('whatsapp');
+            const doc = await statusDocRef.get();
+            if (doc.exists && typeof doc.data().botIsPaused === 'boolean') {
+                botPauseState = doc.data().botIsPaused;
+                console.log(`[Worker ${userId}][PAUSE] Estado de pausa cargado desde Firestore: ${botPauseState}`);
+            }
+        } catch (error) {
+            console.error(`[Worker ${userId}][PAUSE] Error al cargar estado de pausa:`, error);
+        }
+    }
+}

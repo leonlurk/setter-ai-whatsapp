@@ -104,6 +104,16 @@ if (!fs.existsSync(BASE_DATA_DIR)){
 app.use(cors());
 app.use(express.json());
 
+// Middleware para manejar prefijo /setter-api en rutas
+app.use((req, res, next) => {
+    // Si la ruta comienza con /setter-api, eliminar ese prefijo para que coincida con nuestras definiciones de rutas
+    if (req.url.startsWith('/setter-api')) {
+        req.url = req.url.replace('/setter-api', '');
+        console.log(`[Server] Ruta con prefijo /setter-api detectada. Redirigiendo a: ${req.url}`);
+    }
+    next();
+});
+
 // <<< ADDED: Basic API Key Authentication Middleware >>>
 const API_SECRET_KEY = process.env.API_SECRET_KEY;
 if (!API_SECRET_KEY) {
@@ -2692,3 +2702,72 @@ app.get('/users/:userId/kanban-boards/:boardId/chats-by-column', async (req, res
 
 
 // === FIN Rutas para Gestión de Kanban (CRM) ===
+
+// <<< AÑADIR: Endpoint para pausar/reactivar el bot >>>
+app.post('/bot/:userId/pause', authenticateApiKey, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { pause = true } = req.body; // Por defecto pausa si no se especifica
+        
+        // Verificar que el worker está en ejecución
+        const workerProcess = workers[userId]; // Corregido: workers en lugar de workerProcesses
+        if (!workerProcess) {
+            return res.status(404).json({ 
+                success: false, 
+                message: "Bot no encontrado o no iniciado" 
+            });
+        }
+        
+        // Enviar comando al worker
+        notifyWorker(userId, { 
+            type: 'PAUSE_BOT', 
+            payload: { pause } 
+        });
+        
+        res.json({ 
+            success: true, 
+            message: `Bot ${pause ? 'pausado' : 'activado'} correctamente`,
+            isPaused: pause
+        });
+    } catch (error) {
+        console.error(`[Server] Error en endpoint /bot/:userId/pause:`, error);
+        res.status(500).json({ 
+            success: false, 
+            message: `Error: ${error.message}` 
+        });
+    }
+});
+
+// <<< AÑADIR: Endpoint para consultar estado actual incluyendo pausa >>>
+app.get('/bot/:userId/status', authenticateApiKey, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        
+        // Consultar Firestore para obtener estado
+        const db = admin.firestore();
+        const statusDoc = await db.collection('users').doc(userId).collection('status').doc('whatsapp').get();
+        
+        let status = {
+            connected: false,
+            botIsPaused: false
+        };
+        
+        if (statusDoc.exists) {
+            status = { ...status, ...statusDoc.data() };
+        }
+        
+        // Verificar si el worker está en ejecución actualmente
+        status.workerRunning = !!workers[userId]; // Corregido: workers en lugar de workerProcesses
+        
+        res.json({
+            success: true,
+            status
+        });
+    } catch (error) {
+        console.error(`[Server] Error en endpoint /bot/:userId/status:`, error);
+        res.status(500).json({ 
+            success: false, 
+            message: `Error: ${error.message}` 
+        });
+    }
+});
