@@ -1,6 +1,9 @@
 + console.log(`[Worker ${process.argv[2] || 'UNKNOWN'}] --- SCRIPT WORKER EJECUTÁNDOSE --- Timestamp: ${new Date().toISOString()}`); // <-- LOG DE INICIO
 const path = require('path');
 const fs = require('fs');
+const puppeteer = require('puppeteer-extra'); // Changed to puppeteer-extra
+const StealthPlugin = require('puppeteer-extra-plugin-stealth'); // Added stealth plugin
+puppeteer.use(StealthPlugin()); // Apply stealth plugin
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js'); // Usar LocalAuth para sesiones persistentes
 const qrcodeTerminal = require('qrcode-terminal'); // La que ya tenías, renombrada
 const qrcodeDataUrl = require('qrcode');
@@ -22,6 +25,9 @@ console.log(`[Worker ${userId}] Iniciando worker...`);
 let initialActiveAgentId = process.argv[3] || null;
 // console.log(`[Worker ${userId}] Active Agent ID inicial: ${initialActiveAgentId || 'Ninguno (usará default)'}`); // Log movido
 
+// <<< AÑADIR: Variable global para control de estado de pausa >>>
+let botPauseState = false; // Por defecto, el bot no está pausado
+
 // --- Definición de Rutas y Archivos ---
 const USER_DATA_PATH = path.join(__dirname, 'data_v2', userId);
 const SESSION_PATH = path.join(USER_DATA_PATH, '.wwebjs_auth'); // Directorio para la sesión de WhatsApp
@@ -38,6 +44,8 @@ if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 // --- Carga Inicial de Configuración ---
 console.log(`[Worker ${userId}] Preparando configuración inicial (esperando datos via IPC)...`);
+
+const MODERN_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36'; // Added Modern User Agent
 
 // Configuración por defecto para el agente
 const DEFAULT_AGENT_CONFIG = {
@@ -79,6 +87,9 @@ try {
          console.log(`[Worker ${userId}] Firebase Admin SDK already initialized.`);
     }
     firestoreDbWorker = admin.firestore();
+    
+    // Cargar estado de pausa después de inicializar Firestore
+    loadBotPauseState();
 } catch (error) {
     console.error(`[Worker ${userId}][ERROR CRÍTICO] Initializing Firebase Admin SDK in worker:`, error);
     // Notify master?
@@ -611,12 +622,34 @@ async function executeActionFlow(message, flow) {
 
 // --- Listeners de Eventos del Cliente WhatsApp ---
 const client = new Client({
-    authStrategy: new LocalAuth({ clientId: userId, dataPath: SESSION_PATH }), // Usa LocalAuth con ruta específica
+    authStrategy: new LocalAuth({
+        clientId: userId, // Usar userId como clientId para el worker
+        dataPath: USER_DATA_PATH // Usar la ruta de datos del usuario
+    }),
     puppeteer: {
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'], // Añadir disable-gpu
-        headless: true
-    }
+        headless: true, // Correr en modo headless
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--single-process', // Deshabilitado para Linux, podría ser útil en otros entornos
+            '--disable-gpu',
+            '--log-level=3', // Suppress verbose logging
+            '--disable-logging', // Suppress Chromium logging
+            '--hide-scrollbars', // Hide scrollbars
+            '--mute-audio' // Mute audio
+        ],
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, // Opcional: ruta al ejecutable de Chromium
+        userAgent: MODERN_USER_AGENT // Set the modern user agent
+    },
+    // Otras opciones del cliente aquí si es necesario
+    // version: '2.2409.2', // Descomentar y ajustar si necesitas una versión específica de WA Web
+    // ffmpegPath: '/path/to/ffmpeg', // Si necesitas procesamiento de audio/video
 });
+console.log(`[Worker ${userId}] WhatsApp Client Configurado con UserID: ${userId}, DataPath: ${USER_DATA_PATH}`);
 
 // AÑADIR FUNCIÓN DE DIAGNÓSTICO DE PUPPETEER
 async function diagnosePuppeteerEnvironment() {
@@ -894,9 +927,12 @@ client.on('message', async (message) => {
         const userIsActive = await isUserActiveInChat(userId, sender);
         console.log(`[Worker ${userId}][PRESENCE CHECK v2] Resultado: ${userIsActive ? 'ACTIVO' : 'INACTIVO'} (${userIsActive ? 'no responder automáticamente' : 'responder automáticamente'})`);
 
-        // Si el usuario está inactivo, procesar respuestas automáticas
-        if (!userIsActive) {
-          console.log(`[Worker ${userId}][AUTO-REPLY v2] Usuario INACTIVO. Procesando posibles respuestas automáticas para: ${sender}`);
+        // <<< AÑADIR: Verificación de estado de pausa >>>
+        console.log(`[Worker ${userId}][PAUSE CHECK] Estado de pausa: ${botPauseState ? 'PAUSADO' : 'ACTIVO'}`);
+        
+        // Si el usuario está inactivo Y el bot NO está pausado, procesar respuestas automáticas
+        if (!userIsActive && !botPauseState) {
+          console.log(`[Worker ${userId}][AUTO-REPLY v2] Usuario INACTIVO y bot NO PAUSADO. Procesando posibles respuestas automáticas para: ${sender}`);
 
 
           // 1. Verificar si hay un flujo activado por el mensaje
@@ -1010,8 +1046,11 @@ client.on('message', async (message) => {
               // Flag removed - no reset needed
           }
         } else {
-          console.log(`[Worker ${userId}][AUTO-REPLY v2] Usuario ACTIVO. No se enviarán respuestas automáticas.`);
-          // Flag removed - no reset needed
+          if (userIsActive) {
+            console.log(`[Worker ${userId}][AUTO-REPLY v2] Usuario ACTIVO. No se enviarán respuestas automáticas.`);
+          } else if (botPauseState) {
+            console.log(`[Worker ${userId}][AUTO-REPLY v2] Bot PAUSADO. No se enviarán respuestas automáticas.`);
+          }
         }
       }
     } catch (dbError) {
@@ -1167,6 +1206,14 @@ process.on('message', async (message) => { // <-- Convertido a async para poder 
             console.log(`[Worker ${userId}][IPC] Limpieza de historial completada después de SWITCH_AGENT.`);
             // <<< ELIMINAR SETEO DE BANDERA >>>
             break;
+            
+        // <<< AÑADIR: Nuevo comando para pausar el bot >>>
+        case 'PAUSE_BOT':
+            console.log(`[Worker ${userId}][IPC] Recibido comando PAUSE_BOT.`);
+            const shouldPause = message.payload?.pause === true;
+            await updateBotPauseState(shouldPause);
+            break;
+            
         case 'INITIAL_CONFIG':
             console.log(`[Worker ${userId}] Recibida configuración inicial del Master.`);
             const configPayload = message.payload;
@@ -2204,3 +2251,40 @@ async function deleteQueryBatch(query, batchSize, resolve, reject) {
     }
 }
 // <<< FIN NUEVAS FUNCIONES >>>
+
+// <<< AÑADIR: Función para actualizar el estado de pausa >>>
+async function updateBotPauseState(isPaused) {
+    botPauseState = isPaused; // Actualizar variable en memoria
+    
+    // Persistir en Firestore para que sobreviva reinicios
+    if (firestoreDbWorker) {
+        try {
+            const statusDocRef = firestoreDbWorker.collection('users').doc(userId).collection('status').doc('whatsapp');
+            await statusDocRef.set({ 
+                botIsPaused: isPaused,
+                botPauseUpdatedAt: admin.firestore.FieldValue.serverTimestamp() 
+            }, { merge: true });
+            console.log(`[Worker ${userId}][PAUSE] Estado de pausa actualizado en Firestore: ${isPaused}`);
+        } catch (error) {
+            console.error(`[Worker ${userId}][PAUSE] Error al actualizar estado de pausa en Firestore:`, error);
+        }
+    }
+    
+    console.log(`[Worker ${userId}][PAUSE] Bot ${isPaused ? 'PAUSADO' : 'ACTIVADO'}`);
+}
+
+// <<< AÑADIR: Función para cargar el estado de pausa desde Firestore >>>
+async function loadBotPauseState() {
+    if (firestoreDbWorker) {
+        try {
+            const statusDocRef = firestoreDbWorker.collection('users').doc(userId).collection('status').doc('whatsapp');
+            const doc = await statusDocRef.get();
+            if (doc.exists && typeof doc.data().botIsPaused === 'boolean') {
+                botPauseState = doc.data().botIsPaused;
+                console.log(`[Worker ${userId}][PAUSE] Estado de pausa cargado desde Firestore: ${botPauseState}`);
+            }
+        } catch (error) {
+            console.error(`[Worker ${userId}][PAUSE] Error al cargar estado de pausa:`, error);
+        }
+    }
+}
