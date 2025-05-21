@@ -1,9 +1,6 @@
 + console.log(`[Worker ${process.argv[2] || 'UNKNOWN'}] --- SCRIPT WORKER EJECUTÁNDOSE --- Timestamp: ${new Date().toISOString()}`); // <-- LOG DE INICIO
 const path = require('path');
 const fs = require('fs');
-const puppeteer = require('puppeteer-extra'); // Changed to puppeteer-extra
-const StealthPlugin = require('puppeteer-extra-plugin-stealth'); // Added stealth plugin
-puppeteer.use(StealthPlugin()); // Apply stealth plugin
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js'); // Usar LocalAuth para sesiones persistentes
 const qrcodeTerminal = require('qrcode-terminal'); // La que ya tenías, renombrada
 const qrcodeDataUrl = require('qrcode');
@@ -44,8 +41,6 @@ if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 // --- Carga Inicial de Configuración ---
 console.log(`[Worker ${userId}] Preparando configuración inicial (esperando datos via IPC)...`);
-
-const MODERN_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36'; // Added Modern User Agent
 
 // Configuración por defecto para el agente
 const DEFAULT_AGENT_CONFIG = {
@@ -622,34 +617,12 @@ async function executeActionFlow(message, flow) {
 
 // --- Listeners de Eventos del Cliente WhatsApp ---
 const client = new Client({
-    authStrategy: new LocalAuth({
-        clientId: userId, // Usar userId como clientId para el worker
-        dataPath: USER_DATA_PATH // Usar la ruta de datos del usuario
-    }),
+    authStrategy: new LocalAuth({ clientId: userId, dataPath: SESSION_PATH }), // Usa LocalAuth con ruta específica
     puppeteer: {
-        headless: true, // Correr en modo headless
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--single-process', // Deshabilitado para Linux, podría ser útil en otros entornos
-            '--disable-gpu',
-            '--log-level=3', // Suppress verbose logging
-            '--disable-logging', // Suppress Chromium logging
-            '--hide-scrollbars', // Hide scrollbars
-            '--mute-audio' // Mute audio
-        ],
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, // Opcional: ruta al ejecutable de Chromium
-        userAgent: MODERN_USER_AGENT // Set the modern user agent
-    },
-    // Otras opciones del cliente aquí si es necesario
-    // version: '2.2409.2', // Descomentar y ajustar si necesitas una versión específica de WA Web
-    // ffmpegPath: '/path/to/ffmpeg', // Si necesitas procesamiento de audio/video
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'], // Añadir disable-gpu
+        headless: true
+    }
 });
-console.log(`[Worker ${userId}] WhatsApp Client Configurado con UserID: ${userId}, DataPath: ${USER_DATA_PATH}`);
 
 // AÑADIR FUNCIÓN DE DIAGNÓSTICO DE PUPPETEER
 async function diagnosePuppeteerEnvironment() {
